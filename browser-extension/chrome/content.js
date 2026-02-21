@@ -438,10 +438,50 @@ function handleListPage() {
   });
 }
 
+// ── JLCPCB parts page ────────────────────────────────────────────────────────
+// JLCPCB's component library (jlcpcb.com/parts) shows LCSC part numbers in
+// each row. We find them and inject compact import buttons next to each one.
+
+const LCSC_ID_RE = /^C\d{4,}$/;
+
+function handleJlcpcbPage() {
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const p = node.parentElement;
+      if (!p || SKIP_TAGS.has(p.tagName)) return NodeFilter.FILTER_SKIP;
+      const style = window.getComputedStyle(p);
+      if (style.display === "none" || style.visibility === "hidden") return NodeFilter.FILTER_SKIP;
+      return LCSC_ID_RE.test(node.textContent.trim())
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_SKIP;
+    },
+  });
+
+  const nodes = [];
+  let node;
+  while ((node = walker.nextNode())) nodes.push(node);
+
+  nodes.forEach((textNode) => {
+    const lcscId = textNode.textContent.trim();
+    const el = textNode.parentElement;
+
+    // Skip if a button is already right next to this element
+    if (el.nextElementSibling?.classList.contains(BTN_CLASS)) return;
+    if (el.parentElement?.querySelector(`.${BTN_CLASS}`)) return;
+
+    const btn = makeButton(lcscId, true);
+    btn.style.marginLeft = "8px";
+    btn.style.verticalAlign = "middle";
+    el.insertAdjacentElement("afterend", btn);
+  });
+}
+
 // ── router ────────────────────────────────────────────────────────────────────
 
 function run() {
-  if (location.pathname.includes("/product-detail/")) {
+  if (location.hostname.includes("jlcpcb.com")) {
+    handleJlcpcbPage();
+  } else if (location.pathname.includes("/product-detail/")) {
     handleDetailPage();
   } else {
     handleListPage();

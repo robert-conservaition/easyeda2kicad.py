@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 310px;
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      color: #1a1a1a;
+      background: #fff;
+    }
+
+    header {
+      background: #2d6a4f;
+      color: #fff;
+      padding: 12px 16px;
+    }
+    header h1 {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    header p {
+      font-size: 11px;
+      opacity: 0.75;
+      margin-top: 2px;
+    }
+
+    .body { padding: 14px 16px 16px; }
+
+    .field { margin-bottom: 10px; }
+    .field label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: #555;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 4px;
+    }
+    .field input,
+    .field select {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #d0d0d0;
+      border-radius: 4px;
+      font-size: 13px;
+      color: #1a1a1a;
+      background: #fff;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .field input:focus,
+    .field select:focus { border-color: #2d6a4f; }
+
+    #params { margin-top: 2px; }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .actions button {
+      flex: 1;
+      padding: 8px 0;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    #btn-lcsc {
+      background: #2d6a4f;
+      color: #fff;
+    }
+    #btn-lcsc:hover { background: #1b4332; }
+
+    #btn-jlcpcb {
+      background: #1a5276;
+      color: #fff;
+    }
+    #btn-jlcpcb:hover { background: #0f3460; }
+
+    .divider {
+      border: none;
+      border-top: 1px solid #eee;
+      margin: 14px 0 0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>easyeda2kicad</h1>
+    <p>Parametric component search</p>
+  </header>
+
+  <div class="body">
+    <div class="field">
+      <label for="type">Component type</label>
+      <select id="type"></select>
+    </div>
+
+    <div id="params"></div>
+
+    <div class="actions">
+      <button id="btn-lcsc">Search LCSC</button>
+      <button id="btn-jlcpcb">Search JLCPCB</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
