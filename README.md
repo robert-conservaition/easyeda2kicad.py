@@ -102,6 +102,58 @@ easyeda2kicad --symbol --footprint --lcsc_id=C2040
 - Go to Preferences > Manage Footprint Libraries, and Add the global library `easyeda2kicad` : `${EASYEDA2KICAD}/easyeda2kicad.pretty`
 - Enjoy :wink:
 
+## Browser Extension (Chrome, macOS)
+
+A Chrome extension and companion background server allow you to import any LCSC component directly from the browser with a single click, without using the command line.
+
+### Prerequisites
+
+- macOS
+- easyeda2kicad installed (see Installation above)
+- Google Chrome
+- KiCad libraries configured as described in the "Add libraries in Kicad" section above
+
+### Install the background server
+
+The server runs silently in the background and starts automatically at login after a one-time setup.
+
+```bash
+cd browser-extension
+./install.sh
+```
+
+The script will:
+- Locate your `python3` and `easyeda2kicad` executables
+- Copy the server to `~/.easyeda2kicad/server.py`
+- Install a launchd agent (`~/Library/LaunchAgents/com.easyeda2kicad.server.plist`) so the server starts at every login
+- Start the server immediately on port 7777
+
+To uninstall the server:
+
+```bash
+cd browser-extension
+./uninstall.sh
+```
+
+### Install the Chrome extension
+
+1. Open Chrome and navigate to `chrome://extensions`
+2. Enable **Developer mode** using the toggle in the top-right corner
+3. Click **Load unpacked**
+4. Select the `browser-extension/chrome` directory from this repository
+
+The extension requires no further configuration.
+
+### Usage
+
+Browse `lcsc.com` as normal. On any component page, a green **Import to KiCad** button appears next to the part name. Click it to import the symbol, footprint, and 3D model into your KiCad library.
+
+On search and category pages, a compact **→ KiCad** button appears inline with each result.
+
+On a successful import, a notification displays the exact KiCad symbol name with a copy button. Paste the symbol name directly into the KiCad symbol chooser to place the component.
+
+The imported files are written to the same default library path used by the command-line tool (`~/Documents/Kicad/easyeda2kicad/`), so no additional KiCad configuration is required.
+
 ## 🔥 Important Notes
 ### WARRANTY
 The correctness of the symbols and footprints converted by easyeda2kicad can't be guaranteed. Easyeda2kicad speeds up custom library design process, but you should remain careful and always double check the footprints and symbols generated.
