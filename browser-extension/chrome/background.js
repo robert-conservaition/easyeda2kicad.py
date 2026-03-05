@@ -4,6 +4,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   const params = new URLSearchParams({ lcsc_id: message.lcscId });
   if (message.description) params.set("description", message.description);
+  if (message.inStock)     params.set("in_stock",    message.inStock);
 
   fetch(`http://localhost:7777/import?${params}`)
     .then((r) => r.json())

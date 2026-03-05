@@ -36,29 +36,24 @@ function findTextElement(text) {
   return node ? node.parentElement : null;
 }
 
-// Scrape manufacturer, MPN, key attributes from the current LCSC detail page.
-// Falls back gracefully — always returns an object, empty strings if nothing found.
+// Scrape manufacturer, MPN, key attributes, description, and stock from the
+// current LCSC detail page.  Falls back gracefully — always returns an object.
 function scrapePartInfo(lcscId) {
-  const info = { manufacturer: "", mpn: "", attributes: [] };
+  const info = { manufacturer: "", mpn: "", attributes: [], description: "", inStock: "" };
 
   // ── 1. URL parsing (fast, works for most parts) ───────────────────────────
-  // URL pattern: /product-detail/Category_Mfr_MPN_Attrs_C12345.html
-  //           or /product-detail/Category_Mfr-MPN_C12345.html
   const pathMatch = location.pathname.match(/\/product-detail\/(.+?)[/_]C\d+\.html/);
   if (pathMatch) {
     const segs = pathMatch[1].split("_");
     if (segs.length >= 3) {
-      // e.g. ["Solid-Polymer-Electrolytic-Capacitor", "PANASONIC", "25SVPF330M", "330uF-25V"]
       info.manufacturer = segs[segs.length - 2].replace(/-/g, " ");
-      info.mpn          = segs[segs.length - 1]; // last before C-id might be key attrs
-      // If last segment looks like a spec (contains digits + units) treat it as attrs
+      info.mpn          = segs[segs.length - 1];
       if (/\d/.test(info.mpn) && segs.length >= 4) {
         info.attributes.push(info.mpn.replace(/-/g, " "));
         info.mpn = segs[segs.length - 2];
         info.manufacturer = segs[segs.length - 3].replace(/-/g, " ");
       }
     } else if (segs.length === 2) {
-      // e.g. ["General-Purpose-Transistors", "onsemi-MMBT2222ALT1G"]
       const hi = segs[1].indexOf("-");
       if (hi > 0) {
         info.manufacturer = segs[1].slice(0, hi);
@@ -67,9 +62,9 @@ function scrapePartInfo(lcscId) {
     }
   }
 
-  // ── 2. DOM scraping (more accurate when available) ────────────────────────
+  // ── 2. DOM scraping ────────────────────────────────────────────────────────
 
-  // Manufacturer — LCSC puts it near the top of the product page
+  // Manufacturer
   const mfgEl = (
     document.querySelector('[class*="manufactor"] a') ||
     document.querySelector('[class*="brand"] a') ||
@@ -77,29 +72,21 @@ function scrapePartInfo(lcscId) {
     document.querySelector('[class*="mfr-name"]') ||
     document.querySelector('[class*="manufactor"]')
   );
-  if (mfgEl?.textContent.trim()) {
-    info.manufacturer = mfgEl.textContent.trim();
-  }
+  if (mfgEl?.textContent.trim()) info.manufacturer = mfgEl.textContent.trim();
 
-  // MPN — try common selectors
+  // MPN
   const mpnEl = (
     document.querySelector('[class*="product-mpn"]') ||
     document.querySelector('[class*="mfr-part"]') ||
     document.querySelector('[class*="mpn"]')
   );
-  if (mpnEl?.textContent.trim()) {
-    info.mpn = mpnEl.textContent.trim();
-  }
+  if (mpnEl?.textContent.trim()) info.mpn = mpnEl.textContent.trim();
 
-  // Key attributes — LCSC renders them in a table under "Key Attributes"
-  // Try to find the section header then its table
-  const allText = [...document.querySelectorAll("h2, h3, h4, div, span")];
-  const keyAttrHeader = allText.find(
-    (el) =>
-      el.children.length === 0 &&
-      /key\s*attr/i.test(el.textContent)
+  // ── 3. Key Attributes table ────────────────────────────────────────────────
+  const allEls = [...document.querySelectorAll("h2, h3, h4, div, span")];
+  const keyAttrHeader = allEls.find(
+    (el) => el.children.length === 0 && /key\s*attr/i.test(el.textContent)
   );
-
   const attrTable = keyAttrHeader
     ? keyAttrHeader.closest("section, div")?.querySelector("table") ||
       keyAttrHeader.nextElementSibling
@@ -118,19 +105,130 @@ function scrapePartInfo(lcscId) {
     });
   }
 
-  // Build the description string
-  const parts = [];
-  if (info.manufacturer && info.mpn) parts.push(`${info.manufacturer} ${info.mpn}`);
-  else if (info.mpn) parts.push(info.mpn);
-  parts.push(`LCSC: ${lcscId}`);
-  if (info.attributes.length > 0) parts.push(info.attributes.slice(0, 6).join(" | "));
+  // ── 4. In Stock count from LCSC detail page ────────────────────────────────
+  // LCSC shows stock near the "Add to Cart" section.
+  const stockCandidates = [
+    '[class*="stock"] [class*="num"]',
+    '[class*="stock"] [class*="count"]',
+    '[class*="StockNum"]',
+    '[class*="stock-num"]',
+    '[class*="inventory"] [class*="num"]',
+    '[class*="available"] [class*="num"]',
+  ];
+  for (const sel of stockCandidates) {
+    const el = document.querySelector(sel);
+    if (el) {
+      const num = el.textContent.trim().replace(/[^\d]/g, "");
+      if (num) { info.inStock = num; break; }
+    }
+  }
+  // Fallback: walk visible text nodes looking for "In Stock" label + adjacent number
+  if (!info.inStock) {
+    const stockLabel = [...document.querySelectorAll("span, td, div, p")].find(
+      (el) => el.children.length === 0 && /^in\s*stock$/i.test(el.textContent.trim())
+    );
+    if (stockLabel) {
+      const sib = stockLabel.nextElementSibling || stockLabel.parentElement?.nextElementSibling;
+      const num = sib?.textContent.trim().replace(/[^\d]/g, "");
+      if (num) info.inStock = num;
+    }
+  }
 
-  info.description = parts.join(" · ");
+  // ── 5. Build the description string ───────────────────────────────────────
+  // Prefer a clean product description element from the page if available.
+  const descEl = (
+    document.querySelector('[class*="product-intro"] [class*="desc"]') ||
+    document.querySelector('[class*="ProductInfo"] [class*="desc"]') ||
+    document.querySelector('[class*="goods-intro"] p') ||
+    document.querySelector('[class*="detail-desc"]')
+  );
+  if (descEl?.textContent.trim().length > 10) {
+    info.description = descEl.textContent.trim();
+  }
+
+  // If no element found, build from key attributes (best available on detail pages)
+  if (!info.description && info.attributes.length > 0) {
+    const head = [info.manufacturer, info.mpn].filter(Boolean).join(" ");
+    info.description = [head, ...info.attributes.slice(0, 8)].filter(Boolean).join(", ");
+  }
+
+  // Last resort: manufacturer + MPN
+  if (!info.description) {
+    info.description = [info.manufacturer, info.mpn, `LCSC: ${lcscId}`]
+      .filter(Boolean).join(" ");
+  }
+
   return info;
 }
 
-function sendImport(lcscId, description, onResult) {
-  chrome.runtime.sendMessage({ type: "import", lcscId, description }, onResult);
+// Matches price-like cell values (unit prices, price ranges, currency symbols).
+const PRICE_RE = /^[$€£¥]|^\d+\.\d{3,}|[\d.]+\s*~\s*[\d.]+|\/(pc|pcs|piece|ea)\b/i;
+
+// Scrape description and stock count from the JLCPCB/LCSC parts table row that
+// contains `el` (the element holding the LCSC part number text).
+function scrapeJlcpcbRow(el) {
+  const info = { description: "", inStock: "" };
+
+  const row = el.closest("tr");
+  if (!row) return info;
+
+  const table = row.closest("table");
+  if (!table) return info;
+
+  // Detect column positions from the thead.
+  let descIdx = -1, stockIdx = -1;
+  const headerRow = table.querySelector("thead tr");
+  if (headerRow && headerRow !== row) {
+    [...headerRow.querySelectorAll("th, td")].forEach((th, i) => {
+      const t = th.textContent.trim().toLowerCase();
+      if (descIdx  < 0 && /desc/i.test(t))              descIdx  = i;
+      // "qty"/"quantity" alone usually means a price-tier quantity break, NOT stock.
+      // Only match columns explicitly labelled "stock" or "in stock".
+      if (stockIdx < 0 && /^stock$|in[\s-]?stock/i.test(t)) stockIdx = i;
+    });
+  }
+
+  // Use :scope > td to avoid picking up cells from nested price-tier tables.
+  const cells = [...row.querySelectorAll(":scope > td")];
+
+  if (descIdx  >= 0 && cells[descIdx]) {
+    const val = cells[descIdx].textContent.trim();
+    if (!PRICE_RE.test(val)) info.description = val;
+  }
+  if (stockIdx >= 0 && cells[stockIdx]) {
+    info.inStock = cells[stockIdx].textContent.trim().replace(/[^\d]/g, "");
+  }
+
+  // Fallback heuristics when header detection didn't find the columns.
+  if (!info.description || !info.inStock) {
+    for (const cell of cells) {
+      const t = cell.textContent.trim();
+      if (!t || cell.querySelector("img, button, input")) continue;
+      if (PRICE_RE.test(t)) continue; // skip price cells
+      // Stock: a bare integer, must be a plausible quantity (>=4 digits, or >999).
+      // This filters out package codes like 0402/0603/0805 and small MOQ values.
+      const digits = t.replace(/\D/g, "");
+      const PACKAGE_RE = /^(0201|0402|0603|0805|1206|1210|1812|2010|2512|SOT|SOP|QFP|QFN|DIP|TO-)/i;
+      if (!info.inStock && /^\d[\d,\s]*$/.test(t) && digits.length >= 4 && !PACKAGE_RE.test(t)) {
+        info.inStock = digits;
+      // Description: longer text that isn't an LCSC ID or starts with a digit
+      } else if (!info.description && t.length > 15 && !/^C\d+$/.test(t) && !/^\d/.test(t)) {
+        info.description = t;
+      }
+    }
+  }
+
+  return info;
+}
+
+function sendImport(lcscId, description, inStock, onResult) {
+  try {
+    chrome.runtime.sendMessage({ type: "import", lcscId, description, inStock }, onResult);
+  } catch (e) {
+    // Extension context was invalidated (e.g. extension reloaded while page was open).
+    // Tell the user to reload the page.
+    onResult({ success: false, error: "Extension context invalidated — please reload the page (F5) and try again." });
+  }
 }
 
 // ── button factory ────────────────────────────────────────────────────────────
@@ -174,8 +272,12 @@ function makeButton(lcscId, compact = false) {
     btn.style.background = "#888";
     btn.style.cursor = "default";
 
-    const partInfo = scrapePartInfo(lcscId);
-    sendImport(lcscId, partInfo.description, (data) => {
+    // Use pre-scraped row data (JLCPCB / LCSC list) when available,
+    // else scrape the current page (LCSC detail page).
+    const partInfo    = scrapePartInfo(lcscId);
+    const description = btn.dataset.description ?? partInfo.description;
+    const inStock     = btn.dataset.inStock     ?? partInfo.inStock ?? "";
+    sendImport(lcscId, description, inStock, (data) => {
       if (chrome.runtime.lastError || !data) {
         setButtonState(btn, "error", compact ? "✗ offline" : "✗ Server offline", compact);
         return;
@@ -185,7 +287,9 @@ function makeButton(lcscId, compact = false) {
         showSuccessToast(data.symbol_name || lcscId, lcscId);
       } else {
         setButtonState(btn, "error", compact ? "✗" : "✗ Failed", compact);
-        console.error("[easyeda2kicad]", data.stderr || data.error);
+        const errMsg = data.stderr || data.error || "";
+        console.error("[easyeda2kicad]", errMsg);
+        showErrorToast(lcscId, errMsg);
       }
     });
   });
@@ -327,6 +431,91 @@ function showSuccessToast(symbolName, lcscId) {
   setTimeout(() => toast?.remove(), 9000);
 }
 
+// ── error toast ───────────────────────────────────────────────────────────────
+
+function showErrorToast(lcscId, rawError) {
+  document.getElementById("kicad-toast")?.remove();
+
+  const toast = document.createElement("div");
+  toast.id = "kicad-toast";
+  Object.assign(toast.style, {
+    position: "fixed",
+    bottom: "24px",
+    right: "24px",
+    zIndex: "1000000",
+    background: "#7f1d1d",
+    color: "#fff",
+    borderRadius: "8px",
+    padding: "16px 20px",
+    boxShadow: "0 4px 20px rgba(0,0,0,0.35)",
+    fontFamily: "system-ui, sans-serif",
+    fontSize: "14px",
+    lineHeight: "1.5",
+    maxWidth: "360px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px",
+    animation: "kicad-slidein 0.25s ease",
+  });
+
+  // Keyframe (shared — only injected once)
+  if (!document.getElementById("kicad-anim")) {
+    const style = document.createElement("style");
+    style.id = "kicad-anim";
+    style.textContent = `
+      @keyframes kicad-slidein {
+        from { opacity:0; transform: translateY(12px); }
+        to   { opacity:1; transform: translateY(0); }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // Header
+  const header = document.createElement("div");
+  header.style.cssText = "display:flex; align-items:center; gap:8px; font-size:15px; font-weight:700;";
+  header.innerHTML = `<span style="font-size:18px">✗</span> Import failed`;
+  toast.appendChild(header);
+
+  // Clean up the first meaningful line from stderr/error
+  const firstLine = (rawError || "")
+    .split("\n")
+    .map((l) => l.replace(/^\s*\[ERROR\]\s*/i, "").trim())
+    .find((l) => l.length > 0) || "Unknown error";
+
+  const msgEl = document.createElement("div");
+  msgEl.style.cssText = "font-size:12px; opacity:0.9; word-break:break-word;";
+  msgEl.textContent = firstLine;
+  toast.appendChild(msgEl);
+
+  const sub = document.createElement("div");
+  sub.style.cssText = "font-size:11px; opacity:0.65;";
+  sub.textContent = `LCSC: ${lcscId}`;
+  toast.appendChild(sub);
+
+  // Close button
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "×";
+  Object.assign(closeBtn.style, {
+    position: "absolute",
+    top: "10px",
+    right: "12px",
+    background: "none",
+    border: "none",
+    color: "#fff",
+    fontSize: "18px",
+    cursor: "pointer",
+    lineHeight: "1",
+    opacity: "0.7",
+  });
+  closeBtn.addEventListener("click", () => toast.remove());
+  toast.style.position = "fixed";
+  toast.appendChild(closeBtn);
+
+  document.body.appendChild(toast);
+  setTimeout(() => toast?.remove(), 9000);
+}
+
 // ── position tracker ──────────────────────────────────────────────────────────
 // The button lives on document.body (outside React's tree) but uses RAF to
 // continuously match the viewport position of the part-name element so it
@@ -432,7 +621,13 @@ function handleListPage() {
 
     if (anchor.querySelector(`.${BTN_CLASS}`)) return;
 
+    // Pre-scrape description + stock from the product row (same logic as JLCPCB).
+    // scrapeJlcpcbRow walks up to the nearest <tr> and reads from table headers.
+    const rowInfo = row ? scrapeJlcpcbRow(link) : { description: "", inStock: "" };
     const btn = makeButton(lcscId, true);
+    if (rowInfo.description) btn.dataset.description = rowInfo.description;
+    if (rowInfo.inStock)     btn.dataset.inStock     = rowInfo.inStock;
+
     btn.style.marginLeft = "6px";
     link.insertAdjacentElement("afterend", btn);
   });
@@ -469,7 +664,13 @@ function handleJlcpcbPage() {
     if (el.nextElementSibling?.classList.contains(BTN_CLASS)) return;
     if (el.parentElement?.querySelector(`.${BTN_CLASS}`)) return;
 
+    // Scrape description + stock from the surrounding table row up-front so
+    // the data is available immediately when the user clicks the button.
+    const rowInfo = scrapeJlcpcbRow(el);
     const btn = makeButton(lcscId, true);
+    if (rowInfo.description) btn.dataset.description = rowInfo.description;
+    if (rowInfo.inStock)     btn.dataset.inStock     = rowInfo.inStock;
+
     btn.style.marginLeft = "8px";
     btn.style.verticalAlign = "middle";
     el.insertAdjacentElement("afterend", btn);
