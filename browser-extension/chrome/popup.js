@@ -139,3 +139,77 @@ btnJlcpcb.addEventListener("click", () => {
   const q = buildQuery();
   chrome.tabs.create({ url: `https://jlcpcb.com/parts?searchTxt=${encodeURIComponent(q)}` });
 });
+
+// ── Library status & Update All ───────────────────────────────────────────────
+
+const SERVER       = "http://localhost:7777";
+const statusRows   = document.getElementById("status-rows");
+const btnUpdateAll = document.getElementById("btn-update-all");
+const updateMsg    = document.getElementById("update-msg");
+
+function renderStatusRows(items) {
+  statusRows.innerHTML = items
+    .map(([key, val, cls]) =>
+      `<div class="row">
+        <span class="key">${key}</span>
+        <span class="val${cls ? " " + cls : ""}">${val}</span>
+      </div>`
+    )
+    .join("");
+}
+
+function fetchStatus() {
+  statusRows.innerHTML = '<div style="color:#999;font-size:12px;">Loading…</div>';
+  fetch(`${SERVER}/status`, { signal: AbortSignal.timeout(4000) })
+    .then((r) => r.json())
+    .then((data) => {
+      if (!data.success) {
+        renderStatusRows([["Status", "Error", "offline"]]);
+        return;
+      }
+      renderStatusRows([
+        ["Server",        "● Online",                    "online"],
+        ["Library",       data.library_found ? "Found" : "Not found",
+                          data.library_found ? "" : "offline"],
+        ["Total Symbols", String(data.total_symbols || 0), ""],
+        ["LCSC Symbols",  String(data.lcsc_symbols  || 0), ""],
+        ["Last Modified", data.last_modified || "—",       ""],
+      ]);
+    })
+    .catch(() => {
+      renderStatusRows([["Server", "● Offline", "offline"]]);
+    });
+}
+
+document.getElementById("btn-refresh").addEventListener("click", fetchStatus);
+
+btnUpdateAll.addEventListener("click", () => {
+  btnUpdateAll.disabled = true;
+  btnUpdateAll.textContent = "Updating…";
+  updateMsg.textContent = "";
+  updateMsg.style.color = "#555";
+
+  fetch(`${SERVER}/update-all`, { signal: AbortSignal.timeout(120000) })
+    .then((r) => r.json())
+    .then((data) => {
+      btnUpdateAll.disabled = false;
+      btnUpdateAll.textContent = "Update All Parts";
+      if (data.success) {
+        const failNote = data.failed > 0 ? ` (${data.failed} failed)` : "";
+        updateMsg.textContent = `✓ Updated ${data.updated} / ${data.total} parts${failNote}`;
+        updateMsg.style.color = "#1b4332";
+        fetchStatus();
+      } else {
+        updateMsg.textContent = `✗ ${data.error || "Update failed"}`;
+        updateMsg.style.color = "#9b2226";
+      }
+    })
+    .catch(() => {
+      btnUpdateAll.disabled = false;
+      btnUpdateAll.textContent = "Update All Parts";
+      updateMsg.textContent = "✗ Server offline";
+      updateMsg.style.color = "#9b2226";
+    });
+});
+
+fetchStatus();

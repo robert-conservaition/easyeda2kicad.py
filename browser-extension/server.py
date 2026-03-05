@@ -180,7 +180,7 @@ def _dedup_symbol(sym_path, symbol_name):
         print(f"[easyeda2kicad-server] warning: dedup failed: {e}", flush=True)
 
 
-def add_symbol_fields(sym_path, symbol_name, description, in_stock):
+def add_symbol_fields(sym_path, symbol_name, description, in_stock, price="", jlcpcb_class=""):
     """
     Add/update In Stock and Stock Update Date on an easyeda2kicad-generated symbol.
     Also updates the Description field only when the browser supplied something
@@ -213,7 +213,7 @@ def add_symbol_fields(sym_path, symbol_name, description, in_stock):
         )
 
         # Strip old/existing versions of every field we're about to re-write.
-        fields_to_remove = ["ki_description", "In Stock", "Stock Update Date"]
+        fields_to_remove = ["ki_description", "In Stock", "Unit Price", "JLCPCB Class", "Stock Update Date"]
         if desc_is_useful:
             fields_to_remove.append("Description")
 
@@ -235,6 +235,10 @@ def add_symbol_fields(sym_path, symbol_name, description, in_stock):
             props.append(_prop_kicad7("Description", description))
         if in_stock:
             props.append(_prop_kicad7("In Stock", str(in_stock)))
+        if price:
+            props.append(_prop_kicad7("Unit Price", price))
+        if jlcpcb_class:
+            props.append(_prop_kicad7("JLCPCB Class", jlcpcb_class))
         props.append(_prop_kicad7("Stock Update Date", today_str))
 
         content = content[:insert_pos] + "".join(props) + content[insert_pos:]
@@ -566,6 +570,15 @@ def _fetch_lcsc_part_info(lcsc_id):
                      if k not in skip and v and str(v).strip()]
             device_desc = " ".join(pairs[:8])
 
+    # Unit price from the first price tier: [[qty, price, price], ...]
+    price_str = ""
+    price_list = part.get("price", [])
+    if price_list and isinstance(price_list[0], (list, tuple)) and len(price_list[0]) >= 2:
+        tier = price_list[0]
+        price_str = f"${tier[1]} ({tier[0]}+)"
+
+    jlcpcb_class = part.get("JLCPCB Part Class", "")
+
     return {
         "mpn":          part.get("mpn", ""),
         "manufacturer": part.get("manufacturer", ""),
@@ -574,6 +587,8 @@ def _fetch_lcsc_part_info(lcsc_id):
         "category":     category,
         "lcsc_url":     lcsc_url,
         "device_desc":  device_desc,
+        "price_str":    price_str,
+        "jlcpcb_class": jlcpcb_class,
     }
 
 
@@ -631,6 +646,8 @@ def fallback_import(lcsc_id, description, in_stock):
     lcsc_url     = part["lcsc_url"]
     api_stock    = part["stock"]
     device_desc  = part.get("device_desc", "")
+    price_str    = part.get("price_str", "")
+    jlcpcb_class = part.get("jlcpcb_class", "")
 
     # Description priority:
     #   1. Scraped from browser (JLCPCB row / LCSC page key attributes)
@@ -660,6 +677,10 @@ def fallback_import(lcsc_id, description, in_stock):
         extra += _prop_kicad7("Description", desc, indent="    ")
     if stock:
         extra += _prop_kicad7("In Stock", str(stock), indent="    ")
+    if price_str:
+        extra += _prop_kicad7("Unit Price", price_str, indent="    ")
+    if jlcpcb_class:
+        extra += _prop_kicad7("JLCPCB Class", jlcpcb_class, indent="    ")
     extra += _prop_kicad7("Stock Update Date", today_str, indent="    ")
 
     shape = _make_symbol_shape(mpn, ref)
@@ -749,6 +770,133 @@ def fallback_import(lcsc_id, description, in_stock):
 
 
 # ---------------------------------------------------------------------------
+# Bulk update helpers
+# ---------------------------------------------------------------------------
+
+def _find_lcsc_symbols(lib_path):
+    """
+    Return a list of (symbol_name, lcsc_id) for every top-level symbol in the
+    library that has an 'LCSC Part' property.
+    """
+    try:
+        with open(lib_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return []
+
+    results  = []
+    sym_pat  = re.compile(r'^  \(symbol "([^"]+)"', re.MULTILINE)
+    lcsc_pat = re.compile(r'\(property\s+"LCSC Part"\s+"(C\d+)"')
+
+    for m in sym_pat.finditer(content):
+        sym_name = m.group(1)
+        # Sub-symbols end with _N_N — skip them
+        if re.search(r'_\d+_\d+$', sym_name):
+            continue
+
+        # Walk to the end of this symbol block
+        start = m.start()
+        depth = 0
+        i     = start
+        end   = len(content)
+        while i < len(content):
+            if content[i] == "(":
+                depth += 1
+            elif content[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            i += 1
+
+        lcsc_m = lcsc_pat.search(content[start:end])
+        if lcsc_m:
+            results.append((sym_name, lcsc_m.group(1)))
+
+    return results
+
+
+def _get_status(lib_path):
+    """Return a dict describing server + library health."""
+    status = {
+        "success":       True,
+        "server":        "ok",
+        "library_found": False,
+        "lib_path":      lib_path,
+        "total_symbols": 0,
+        "lcsc_symbols":  0,
+        "last_modified": "",
+    }
+    if not os.path.isfile(lib_path):
+        return status
+
+    status["library_found"] = True
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(lib_path))
+        status["last_modified"] = (
+            f"{mtime.strftime('%b')} {mtime.day}, {mtime.year} "
+            f"{mtime.strftime('%H:%M')}"
+        )
+    except Exception:
+        pass
+
+    try:
+        with open(lib_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        sym_pat = re.compile(r'^  \(symbol "([^"]+)"', re.MULTILINE)
+        status["total_symbols"] = sum(
+            1 for m in sym_pat.finditer(content)
+            if not re.search(r'_\d+_\d+$', m.group(1))
+        )
+    except Exception:
+        pass
+
+    status["lcsc_symbols"] = len(_find_lcsc_symbols(lib_path))
+    return status
+
+
+def _update_all_symbols(lib_path):
+    """Batch-update In Stock, Unit Price, JLCPCB Class for all LCSC symbols."""
+    if not os.path.isfile(lib_path):
+        return {"success": False, "error": f"Library not found: {lib_path}"}
+
+    symbols = _find_lcsc_symbols(lib_path)
+    if not symbols:
+        return {"success": True, "updated": 0, "failed": 0, "total": 0,
+                "message": "No LCSC symbols found."}
+
+    updated = 0
+    failed  = 0
+    errors  = []
+
+    for symbol_name, lcsc_id in symbols:
+        part_info = _fetch_lcsc_part_info(lcsc_id)
+        if not part_info:
+            failed += 1
+            errors.append(f"{lcsc_id}: not found in LCSC API")
+            continue
+
+        add_symbol_fields(
+            lib_path,
+            symbol_name,
+            description="",  # don't overwrite user-set descriptions
+            in_stock=str(part_info.get("stock", "")),
+            price=part_info.get("price_str", ""),
+            jlcpcb_class=part_info.get("jlcpcb_class", ""),
+        )
+        updated += 1
+        print(f"[easyeda2kicad-server] update-all: {lcsc_id} ({symbol_name})", flush=True)
+
+    return {
+        "success": True,
+        "updated": updated,
+        "failed":  failed,
+        "total":   len(symbols),
+        "errors":  errors,
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 
@@ -767,6 +915,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+
+        if parsed.path == "/status":
+            self._json(200, _get_status(_default_lib_path()))
+            return
+
+        if parsed.path == "/update-all":
+            self._json(200, _update_all_symbols(_default_lib_path()))
+            return
 
         if parsed.path != "/import":
             self.send_response(404)
@@ -804,6 +960,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Always fetch from LCSC API: stock from the browser is unreliable
                 # (it often picks up package codes like "0603" or MOQ values).
                 # Also use API description when the browser didn't scrape a real one.
+                price        = ""
+                jlcpcb_class = ""
                 part_info = _fetch_lcsc_part_info(lcsc_id)
                 if part_info:
                     is_trivial = (
@@ -816,8 +974,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # Use API stock — it's always accurate
                     if part_info.get("stock"):
                         in_stock = str(part_info["stock"])
+                    price        = part_info.get("price_str", "")
+                    jlcpcb_class = part_info.get("jlcpcb_class", "")
 
-                add_symbol_fields(lib_path, symbol_name, description, in_stock)
+                add_symbol_fields(lib_path, symbol_name, description, in_stock, price, jlcpcb_class)
                 self._json(200, {
                     "success":     True,
                     "symbol_name": symbol_name,

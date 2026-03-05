@@ -2,8 +2,9 @@
 // - On product detail pages: adds a button next to the LCSC part number.
 // - On search / category pages: adds an inline button to every product row.
 
-const BTN_CLASS   = "kicad-import-btn";
-const FLOATING_ID = "kicad-import-floating";
+const BTN_CLASS      = "kicad-import-btn";
+const FLOATING_ID    = "kicad-import-floating";
+const UPDATE_BAR_ID  = "kicad-update-bar";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -579,6 +580,7 @@ function startTracking(btn) {
 function cleanup() {
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   document.getElementById(FLOATING_ID)?.remove();
+  document.getElementById(UPDATE_BAR_ID)?.remove();
   document.querySelectorAll(`.${BTN_CLASS}`).forEach((b) => b.remove());
 }
 
@@ -612,6 +614,7 @@ function handleDetailPage() {
 // ── search / category pages ───────────────────────────────────────────────────
 
 function handleListPage() {
+  injectUpdateAllBar();
   document.querySelectorAll('a[href*="product-detail"]').forEach((link) => {
     const lcscId = lcscIdFromUrl(link.href);
     if (!lcscId) return;
@@ -675,6 +678,102 @@ function handleJlcpcbPage() {
     btn.style.verticalAlign = "middle";
     el.insertAdjacentElement("afterend", btn);
   });
+}
+
+// ── Update All bar (LCSC list / search pages only) ────────────────────────────
+
+function injectUpdateAllBar() {
+  if (document.getElementById(UPDATE_BAR_ID)) return;
+
+  const bar = document.createElement("div");
+  bar.id = UPDATE_BAR_ID;
+  Object.assign(bar.style, {
+    position:   "fixed",
+    top:        "0",
+    left:       "0",
+    right:      "0",
+    zIndex:     "1000001",
+    background: "#1b4332",
+    color:      "#fff",
+    padding:    "7px 16px",
+    display:    "flex",
+    alignItems: "center",
+    gap:        "12px",
+    fontFamily: "system-ui, sans-serif",
+    fontSize:   "13px",
+    boxShadow:  "0 2px 8px rgba(0,0,0,0.25)",
+  });
+
+  const label = document.createElement("span");
+  label.textContent = "easyeda2kicad";
+  label.style.cssText = "font-weight:700; opacity:0.85; flex-shrink:0;";
+
+  const btn = document.createElement("button");
+  btn.textContent = "Update All in KiCad Library";
+  Object.assign(btn.style, {
+    background:   "#2d6a4f",
+    color:        "#fff",
+    border:       "1px solid rgba(255,255,255,0.3)",
+    borderRadius: "4px",
+    padding:      "4px 12px",
+    fontSize:     "12px",
+    fontWeight:   "600",
+    cursor:       "pointer",
+    flexShrink:   "0",
+  });
+
+  const statusSpan = document.createElement("span");
+  statusSpan.style.cssText = "font-size:12px; opacity:0.8; flex:1;";
+
+  const closeBtn = document.createElement("button");
+  closeBtn.textContent = "×";
+  Object.assign(closeBtn.style, {
+    background: "none",
+    border:     "none",
+    color:      "#fff",
+    fontSize:   "20px",
+    cursor:     "pointer",
+    opacity:    "0.65",
+    lineHeight: "1",
+    padding:    "0 4px",
+    flexShrink: "0",
+  });
+  closeBtn.addEventListener("click", () => bar.remove());
+
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    btn.textContent = "Updating…";
+    statusSpan.textContent = "";
+
+    fetch("http://localhost:7777/update-all")
+      .then((r) => r.json())
+      .then((data) => {
+        btn.disabled = false;
+        if (data.success) {
+          btn.textContent = "✓ Done";
+          btn.style.background = "#155724";
+          statusSpan.textContent =
+            `Updated ${data.updated} / ${data.total} parts` +
+            (data.failed > 0 ? ` (${data.failed} failed)` : "");
+        } else {
+          btn.textContent = "✗ Failed";
+          btn.style.background = "#7f1d1d";
+          statusSpan.textContent = data.error || "Update failed";
+        }
+      })
+      .catch(() => {
+        btn.disabled = false;
+        btn.textContent = "✗ Server offline";
+        btn.style.background = "#7f1d1d";
+        statusSpan.textContent = "Is the server running?";
+      });
+  });
+
+  bar.appendChild(label);
+  bar.appendChild(btn);
+  bar.appendChild(statusSpan);
+  bar.appendChild(closeBtn);
+  document.body.appendChild(bar);
 }
 
 // ── router ────────────────────────────────────────────────────────────────────

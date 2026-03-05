@@ -90,6 +90,61 @@
       border-top: 1px solid #eee;
       margin: 14px 0 0;
     }
+
+    .section-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: #555;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    #status-rows .row {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      padding: 3px 0;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    #status-rows .row:last-child { border-bottom: none; }
+    #status-rows .row .key { color: #666; }
+    #status-rows .row .val { font-weight: 600; }
+    #status-rows .online  { color: #1b4332; }
+    #status-rows .offline { color: #9b2226; }
+
+    #btn-update-all {
+      width: 100%;
+      padding: 8px 0;
+      border: none;
+      border-radius: 4px;
+      background: #2d6a4f;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+      margin-top: 10px;
+      transition: background 0.15s;
+    }
+    #btn-update-all:hover:not(:disabled) { background: #1b4332; }
+    #btn-update-all:disabled { background: #888; cursor: default; }
+
+    #btn-refresh {
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+      color: #2d6a4f;
+      padding: 0 4px;
+      line-height: 1;
+    }
+    #btn-refresh:hover { color: #1b4332; }
+
+    #update-msg {
+      font-size: 11px;
+      text-align: center;
+      margin-top: 6px;
+      min-height: 14px;
+    }
   </style>
 </head>
 <body>
@@ -110,6 +165,20 @@
       <button id="btn-lcsc">Search LCSC</button>
       <button id="btn-jlcpcb">Search JLCPCB</button>
     </div>
+  </div>
+
+  <hr class="divider" style="margin: 0;">
+
+  <div class="body" style="padding-top: 12px;">
+    <div style="display:flex; align-items:center; gap:6px; margin-bottom:8px;">
+      <span class="section-label">Library Status</span>
+      <button id="btn-refresh" title="Refresh">↻</button>
+    </div>
+    <div id="status-rows">
+      <div style="color:#999; font-size:12px;">Loading…</div>
+    </div>
+    <button id="btn-update-all">Update All Parts</button>
+    <div id="update-msg"></div>
   </div>
 
   <script src="popup.js"></script>
