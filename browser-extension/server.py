@@ -510,7 +510,7 @@ def _fetch_lcsc_part_info(lcsc_id):
     )
     req = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "easyeda2kicad-server/1.0"},
+        headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -520,12 +520,15 @@ def _fetch_lcsc_part_info(lcsc_id):
         return None
 
     if not data.get("success"):
+        print(f"[easyeda2kicad-server] Pro API returned success=false for {lcsc_id}: {data.get('message', '')}", flush=True)
         return None
 
     products = data.get("result", {}).get("productList", [])
+    print(f"[easyeda2kicad-server] Pro API: {len(products)} results for {lcsc_id}, numbers={[p.get('number') for p in products[:5]]}", flush=True)
     # Exact match on LCSC number
     part = next((p for p in products if p.get("number") == lcsc_id), None)
     if not part:
+        print(f"[easyeda2kicad-server] Pro API: no exact match for {lcsc_id}", flush=True)
         return None
 
     # Best-effort category from the paramList in the same response

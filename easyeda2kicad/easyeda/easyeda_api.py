@@ -19,11 +19,16 @@ class EasyedaApi:
             "Accept-Encoding": "gzip, deflate",
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent": f"easyeda2kicad v{__version__}",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         }
 
     def get_info_from_easyeda_api(self, lcsc_id: str) -> dict:
         r = requests.get(url=API_ENDPOINT.format(lcsc_id=lcsc_id), headers=self.headers)
+
+        if not r.ok or not r.text.strip():
+            logging.debug(f"HTTP {r.status_code} for {lcsc_id}")
+            return {}
+
         api_response = r.json()
 
         if not api_response or (
@@ -32,7 +37,7 @@ class EasyedaApi:
             logging.debug(f"{api_response}")
             return {}
 
-        return r.json()
+        return api_response
 
     def get_cad_data_of_component(self, lcsc_id: str) -> dict:
         cp_cad_info = self.get_info_from_easyeda_api(lcsc_id=lcsc_id)
