@@ -73,17 +73,18 @@
       cursor: pointer;
       transition: background 0.15s;
     }
-    #btn-lcsc {
+    #btn-browse {
       background: #2d6a4f;
       color: #fff;
     }
-    #btn-lcsc:hover { background: #1b4332; }
+    #btn-browse:hover { background: #1b4332; }
 
-    #btn-jlcpcb {
-      background: #1a5276;
-      color: #fff;
+    .hint {
+      font-size: 11px;
+      color: #888;
+      margin-top: 8px;
+      line-height: 1.4;
     }
-    #btn-jlcpcb:hover { background: #0f3460; }
 
     .divider {
       border: none;
@@ -150,21 +151,19 @@
 <body>
   <header>
     <h1>easyeda2kicad</h1>
-    <p>Parametric component search</p>
+    <p>LCSC → KiCad importer</p>
   </header>
 
   <div class="body">
     <div class="field">
-      <label for="type">Component type</label>
-      <select id="type"></select>
+      <label for="category">Browse LCSC category</label>
+      <select id="category"></select>
     </div>
-
-    <div id="params"></div>
 
     <div class="actions">
-      <button id="btn-lcsc">Search LCSC</button>
-      <button id="btn-jlcpcb">Search JLCPCB</button>
+      <button id="btn-browse">Open on LCSC</button>
     </div>
+    <p class="hint">Opens the category on LCSC. Use the “Import to KiCad” button on any part page to add it to your library.</p>
   </div>
 
   <hr class="divider" style="margin: 0;">

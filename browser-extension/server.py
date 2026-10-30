@@ -8,6 +8,7 @@ niche SMD parts), the server falls back to querying the LCSC Pro API directly an
 generating a minimal-but-complete KiCad symbol from scratch.
 """
 
+import glob
 import http.server
 import json
 import os
@@ -15,33 +16,90 @@ import re
 import shutil
 import socketserver
 import subprocess
+import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
 
+# Serialises all library work: mutating requests (a single import while
+# "Update All" runs) can't corrupt the .kicad_sym via overlapping writes, and
+# reads can't observe a half-written file (which would flash 0 symbols).
+# Reentrant so a read helper can call another read helper while holding it.
+_LIB_LOCK = threading.RLock()
+
+# Live progress for the background "Update All" job.
+_UPDATE_LOCK  = threading.Lock()
+_UPDATE_STATE = {
+    "running": False, "total": 0, "done": 0, "updated": 0, "failed": 0,
+    "current": "", "errors": [], "started_at": None, "finished_at": None,
+}
+
 PORT = 7777
+_START_TIME = time.time()
 
 # ---------------------------------------------------------------------------
 # easyeda2kicad location
 # ---------------------------------------------------------------------------
 
+def _easyeda2kicad_works(path):
+    """Return True when the easyeda2kicad binary can import and run."""
+    try:
+        result = subprocess.run(
+            [path, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    combined = (result.stdout or "") + (result.stderr or "")
+    return result.returncode == 0 and "Traceback" not in combined
+
+
 def find_easyeda2kicad():
+    candidates = []
     found = shutil.which("easyeda2kicad")
     if found:
-        return found
-    for c in [
+        candidates.append(found)
+    candidates.extend([
         os.path.expanduser("~/miniconda3/bin/easyeda2kicad"),
         os.path.expanduser("~/anaconda3/bin/easyeda2kicad"),
         os.path.expanduser("~/.local/bin/easyeda2kicad"),
         "/usr/local/bin/easyeda2kicad",
         "/opt/homebrew/bin/easyeda2kicad",
-    ]:
-        if os.path.isfile(c):
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            ".venv",
+            "bin",
+            "easyeda2kicad",
+        ),
+    ])
+    seen = set()
+    for c in candidates:
+        c = os.path.abspath(c)
+        if c in seen or not os.path.isfile(c):
+            continue
+        seen.add(c)
+        if _easyeda2kicad_works(c):
             return c
     return None
 
 
 EASYEDA2KICAD = find_easyeda2kicad()
+
+
+def get_easyeda2kicad():
+    """Return the easyeda2kicad path, re-probing if the startup lookup failed.
+
+    The lookup can fail transiently when launchd starts the server at login
+    (e.g. before ~/Documents is readable), so don't cache a miss forever.
+    """
+    global EASYEDA2KICAD
+    if not EASYEDA2KICAD:
+        EASYEDA2KICAD = find_easyeda2kicad()
+    return EASYEDA2KICAD
 
 
 # ---------------------------------------------------------------------------
@@ -141,20 +199,10 @@ def _dedup_symbol(sym_path, symbol_name):
             idx = content.find(pattern, pos)
             if idx == -1:
                 break
-            depth, i = 0, idx
-            while i < len(content):
-                if content[i] == "(":
-                    depth += 1
-                elif content[i] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        starts.append(idx)
-                        ends.append(i + 1)
-                        pos = i + 1
-                        break
-                i += 1
-            else:
-                break
+            end = _match_block(content, idx)
+            starts.append(idx)
+            ends.append(end)
+            pos = end
 
         if len(starts) <= 1:
             return
@@ -163,8 +211,6 @@ def _dedup_symbol(sym_path, symbol_name):
         for start, end in zip(reversed(starts[:-1]), reversed(ends[:-1])):
             block_start = start
             while block_start > 0 and content[block_start - 1] in (" ", "\t"):
-                block_start -= 1
-            if block_start > 0 and content[block_start - 1] == "\n":
                 block_start -= 1
             block_end = end
             if block_end < len(content) and content[block_end] == "\n":
@@ -602,26 +648,49 @@ def _default_lib_path():
     )
 
 
+_SYMBOL_NAME_RE = re.compile(r'\(symbol "((?:[^"\\]|\\.)*)"')
+
+
+def _iter_top_symbols(content):
+    """
+    Yield (name, line_start, paren_index, end) for every *top-level* symbol —
+    a (symbol ...) that is a direct child of (kicad_symbol_lib), i.e. at paren
+    depth 1.  Purely structural, so it works no matter how the file is indented
+    (KiCad 9 uses tabs; easyeda2kicad appends with spaces; libraries end up
+    mixed).  Nested unit sub-symbols (depth 2, "NAME_0_1") are never yielded.
+    """
+    i, n, depth = 0, len(content), 0
+    while i < n:
+        c = content[i]
+        if c == '"':                      # skip over string literals
+            i += 1
+            while i < n and content[i] != '"':
+                if content[i] == '\\':
+                    i += 1
+                i += 1
+            i += 1
+            continue
+        if c == '(':
+            if depth == 1 and content.startswith('(symbol "', i):
+                m = _SYMBOL_NAME_RE.match(content, i)
+                if m:
+                    ls = i
+                    while ls > 0 and content[ls - 1] in " \t":
+                        ls -= 1
+                    yield m.group(1), ls, i, _match_block(content, i)
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        i += 1
+
+
 def _remove_existing_symbol(content, symbol_name):
     """Remove a top-level symbol block matching (symbol "symbol_name" ...) from content."""
-    pat = re.compile(r'  \(symbol "' + re.escape(symbol_name) + r'"')
-    m = pat.search(content)
-    if not m:
-        return content
-    start = m.start()
-    depth = 0
-    i = start
-    while i < len(content):
-        if content[i] == "(":
-            depth += 1
-        elif content[i] == ")":
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                if end < len(content) and content[end] == "\n":
-                    end += 1
-                return content[:start] + content[end:]
-        i += 1
+    for name, line_start, paren, end in _iter_top_symbols(content):
+        if name == symbol_name:
+            if end < len(content) and content[end] == "\n":
+                end += 1
+            return content[:line_start] + content[end:]
     return content
 
 
@@ -652,11 +721,12 @@ def fallback_import(lcsc_id, description, in_stock):
     price_str    = part.get("price_str", "")
     jlcpcb_class = part.get("jlcpcb_class", "")
 
-    # Description priority:
-    #   1. Scraped from browser (JLCPCB row / LCSC page key attributes)
-    #   2. EasyEDA Pro device_info description / attributes
+    # Description priority (Key Attributes → Description):
+    #   1. EasyEDA Pro device_info Key Attributes string
+    #   2. Scraped from browser (JLCPCB row / LCSC page key attributes)
     #   3. Manufacturer + MPN as last resort
-    desc  = description or device_desc or f"{manufacturer} {mpn}".strip()
+    desc  = device_desc or description or f"{manufacturer} {mpn}".strip()
+    desc  = _desc_with_part(desc, lcsc_id)
     stock = in_stock or api_stock
 
     ref, _prefix  = _detect_component_type(category, mpn)
@@ -721,7 +791,7 @@ def fallback_import(lcsc_id, description, in_stock):
         f'      (effects (font (size 1.27 1.27) ) hide)\n'
         f'    )\n'
         f'    (property\n'
-        f'      "LCSC Part"\n'
+        f'      "JLCPCB Part #"\n'
         f'      "{esc(lcsc_id)}"\n'
         f'      (id 5)\n'
         f'      (at 0 -12.70 0)\n'
@@ -773,46 +843,228 @@ def fallback_import(lcsc_id, description, in_stock):
 
 
 # ---------------------------------------------------------------------------
-# Bulk update helpers
+# Shared single-part import (used by /import and /update-all)
 # ---------------------------------------------------------------------------
 
-def _find_lcsc_symbols(lib_path):
+def _desc_with_part(desc, lcsc_id):
+    """Ensure the LCSC/JLCPCB part number is present in the Description text."""
+    desc = (desc or "").strip()
+    if lcsc_id and lcsc_id not in desc:
+        desc = f"{desc} | {lcsc_id}".lstrip(" |").strip()
+    return desc
+
+
+def _dedupe_lcsc_orphans(lib_path):
     """
-    Return a list of (symbol_name, lcsc_id) for every top-level symbol in the
-    library that has an 'LCSC Part' property.
+    Remove orphaned duplicate symbols that share an LCSC/JLCPCB part number.
+
+    When EasyEDA renames a part's symbol between imports (e.g.
+    "XT90PW-F.G.Y" -> "XT90PW-F30.G.Y"), a plain re-import leaves the old symbol
+    behind because the name-based dedup can't match it.  Here we group all
+    top-level symbols by their part number and keep only the freshest (the one
+    that carries a Stock Update Date, else the last one in the file).
     """
     try:
         with open(lib_path, "r", encoding="utf-8") as f:
             content = f.read()
     except Exception:
+        return
+
+    entries = []
+    for name, line_start, paren, end in _iter_top_symbols(content):
+        props = _sym_properties(content[paren:end])
+        lcsc  = _lcsc_of(props)
+        if lcsc:
+            entries.append({"name": name, "start": line_start, "end": end,
+                            "lcsc": lcsc, "dated": bool(props.get("Stock Update Date"))})
+
+    groups = {}
+    for e in entries:
+        groups.setdefault(e["lcsc"], []).append(e)
+
+    remove = []
+    for es in groups.values():
+        if len(es) <= 1:
+            continue
+        keep = max(es, key=lambda e: (e["dated"], e["start"]))
+        remove.extend(e for e in es if e is not keep)
+
+    if not remove:
+        return
+
+    for e in sorted(remove, key=lambda e: e["start"], reverse=True):
+        s, en = e["start"], e["end"]
+        while en < len(content) and content[en] == "\n":
+            en += 1
+        content = content[:s] + content[en:]
+
+    with open(lib_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"[easyeda2kicad-server] removed {len(remove)} orphaned duplicate symbol(s)", flush=True)
+
+
+def _import_one(lcsc_id, description="", in_stock=""):
+    """Library-locked wrapper around _import_one_unlocked (serialises writes)."""
+    with _LIB_LOCK:
+        return _import_one_unlocked(lcsc_id, description, in_stock)
+
+
+def _import_one_unlocked(lcsc_id, description="", in_stock=""):
+    """
+    Run easyeda2kicad for a single part, deduplicate, and patch the stock/price/
+    class/description fields.  Falls back to the LCSC-API symbol generator when
+    easyeda2kicad can't find the part.  Returns a result dict.
+
+    The Description field is always sourced from the part's Key Attributes
+    (the EasyEDA Pro `device_info` description) when available, falling back to
+    whatever the browser scraped.
+    """
+    if not get_easyeda2kicad():
+        return {"success": False, "error": "easyeda2kicad not found in PATH"}
+
+    # Without read access the cleanup after the import can't run, which would
+    # leave duplicate symbols behind, so stop before touching the library.
+    default_lib = _default_lib_path()
+    if os.path.isfile(default_lib):
+        try:
+            _read_lib(default_lib)
+        except PermissionError:
+            return {
+                "success": False,
+                "error": (
+                    "No access to your KiCad library. Grant Python Full Disk "
+                    "Access (see README.md), then try again."
+                ),
+            }
+
+    try:
+        result = subprocess.run(
+            [EASYEDA2KICAD, "--full", "--overwrite", f"--lcsc_id={lcsc_id}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "command timed out"}
+
+    success     = result.returncode == 0
+    symbol_name = parse_symbol_name(result.stderr)
+    lib_path    = parse_lib_path(result.stderr)
+
+    if success and symbol_name and lib_path:
+        # Normal path: easyeda2kicad succeeded.
+        # Deduplicate first (--overwrite appends, doesn't remove old entry).
+        _dedup_symbol(lib_path, symbol_name)
+
+        price        = ""
+        jlcpcb_class = ""
+        part_info = _fetch_lcsc_part_info(lcsc_id)
+        if part_info:
+            # Key Attributes → Description: always prefer the API's key-attribute
+            # string over the browser scrape when we have it.
+            if part_info.get("device_desc"):
+                description = part_info["device_desc"]
+            # API stock is always accurate — browser stock is unreliable.
+            if part_info.get("stock"):
+                in_stock = str(part_info["stock"])
+            price        = part_info.get("price_str", "")
+            jlcpcb_class = part_info.get("jlcpcb_class", "")
+
+        # Always keep the part number in the Description too.
+        description = _desc_with_part(description, lcsc_id)
+        add_symbol_fields(lib_path, symbol_name, description, in_stock, price, jlcpcb_class)
+        # Clean up any orphan left behind if EasyEDA renamed this part's symbol.
+        _dedupe_lcsc_orphans(lib_path)
+        return {
+            "success":     True,
+            "symbol_name": symbol_name,
+            "lib_path":    lib_path,
+            "stdout":      result.stdout,
+            "stderr":      result.stderr,
+        }
+
+    combined = (result.stdout or "") + (result.stderr or "")
+    # Only a genuine import/dependency failure means the install itself is broken.
+    # A part-specific traceback (unsupported symbol, odd 3D model, etc.) is NOT —
+    # it should fall through to the LCSC-API fallback generator below.
+    if "ModuleNotFoundError" in combined or "No module named" in combined:
+        return {
+            "success": False,
+            "error": (
+                "easyeda2kicad is installed but broken. Reinstall it, "
+                "then restart the browser-extension server."
+            ),
+            "stderr": combined,
+        }
+
+    # easyeda2kicad failed — part likely not in EasyEDA's database.
+    # Try generating a minimal symbol directly from the LCSC Pro API.
+    print(
+        f"[easyeda2kicad-server] easyeda2kicad failed for {lcsc_id}, "
+        f"trying fallback import…",
+        flush=True,
+    )
+    fb = fallback_import(lcsc_id, description, in_stock)
+    if fb.get("success"):
+        # Same orphan cleanup as the easyeda2kicad path (was previously missing
+        # here, which let update-all accumulate duplicate symbols).
+        _dedupe_lcsc_orphans(fb.get("lib_path") or _default_lib_path())
+    else:
+        fb["stderr"] = result.stderr + "\n\nFallback error: " + fb.get("error", "")
+    return fb
+
+
+# ---------------------------------------------------------------------------
+# Bulk update helpers
+# ---------------------------------------------------------------------------
+
+# Older imports used the field name "LCSC Part"; newer ones use "JLCPCB Part #".
+# Match both so an existing library stays discoverable by Update All.
+_PART_FIELD_RE = r'(?:LCSC Part|JLCPCB Part #)'
+
+
+def _read_lib(lib_path):
+    """
+    Read the whole library file under the library lock so a reader never
+    observes a half-written file mid-import (which parses to 0 symbols).
+    Re-raises PermissionError (macOS TCC) so callers can surface it.
+    """
+    with _LIB_LOCK:
+        try:
+            with open(lib_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except PermissionError:
+            _restart_for_permission_error()
+            raise
+
+
+def _restart_for_permission_error():
+    """
+    Exit so launchd starts a fresh server.  macOS can keep denying a process
+    that started at login even once its Full Disk Access is in effect; a new
+    process gets the correct answer.  Waits a moment so the current request
+    can still report the error.
+    """
+    if time.time() - _START_TIME > 30:
+        threading.Timer(1.0, os._exit, args=(1,)).start()
+
+
+def _find_lcsc_symbols(lib_path):
+    """
+    Return a list of (symbol_name, lcsc_id) for every top-level symbol in the
+    library that carries an LCSC part-number property (either the legacy
+    "LCSC Part" field or the current "JLCPCB Part #" field).
+    """
+    try:
+        content = _read_lib(lib_path)
+    except Exception:
         return []
 
     results  = []
-    sym_pat  = re.compile(r'^  \(symbol "([^"]+)"', re.MULTILINE)
-    lcsc_pat = re.compile(r'\(property\s+"LCSC Part"\s+"(C\d+)"')
+    lcsc_pat = re.compile(r'\(property\s+"' + _PART_FIELD_RE + r'"\s+"(C\d+)"')
 
-    for m in sym_pat.finditer(content):
-        sym_name = m.group(1)
-        # Sub-symbols end with _N_N — skip them
-        if re.search(r'_\d+_\d+$', sym_name):
-            continue
-
-        # Walk to the end of this symbol block
-        start = m.start()
-        depth = 0
-        i     = start
-        end   = len(content)
-        while i < len(content):
-            if content[i] == "(":
-                depth += 1
-            elif content[i] == ")":
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-            i += 1
-
-        lcsc_m = lcsc_pat.search(content[start:end])
+    for sym_name, line_start, paren, end in _iter_top_symbols(content):
+        lcsc_m = lcsc_pat.search(content[paren:end])
         if lcsc_m:
             results.append((sym_name, lcsc_m.group(1)))
 
@@ -844,13 +1096,15 @@ def _get_status(lib_path):
         pass
 
     try:
-        with open(lib_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        sym_pat = re.compile(r'^  \(symbol "([^"]+)"', re.MULTILINE)
-        status["total_symbols"] = sum(
-            1 for m in sym_pat.finditer(content)
-            if not re.search(r'_\d+_\d+$', m.group(1))
-        )
+        content = _read_lib(lib_path)
+        status["total_symbols"] = sum(1 for _ in _iter_top_symbols(content))
+    except PermissionError:
+        # macOS TCC blocks background launchd agents from reading ~/Documents
+        # until the agent is granted Full Disk Access.
+        status["error"] = "permission_denied"
+        status["hint"]  = ("This server can't read your KiCad library. Grant Full Disk "
+                           "Access to the Python running it (System Settings › Privacy & "
+                           "Security › Full Disk Access), then restart the server.")
     except Exception:
         pass
 
@@ -858,45 +1112,682 @@ def _get_status(lib_path):
     return status
 
 
-def _update_all_symbols(lib_path):
-    """Batch-update In Stock, Unit Price, JLCPCB Class for all LCSC symbols."""
+def _update_progress():
+    """Snapshot of the background Update All job."""
+    with _UPDATE_LOCK:
+        s = dict(_UPDATE_STATE)
+    s["errors"] = s["errors"][-25:]
+    s["success"] = True
+    return s
+
+
+def _run_update_all(lib_path, symbols):
+    """Background worker: full re-import of every part, updating progress state."""
+    for symbol_name, lcsc_id in symbols:
+        with _UPDATE_LOCK:
+            _UPDATE_STATE["current"] = f"{lcsc_id} ({symbol_name})"
+        try:
+            res = _import_one(lcsc_id)
+        except Exception as exc:
+            res = {"success": False, "error": str(exc)}
+        with _UPDATE_LOCK:
+            _UPDATE_STATE["done"] += 1
+            if res.get("success"):
+                _UPDATE_STATE["updated"] += 1
+                print(f"[easyeda2kicad-server] update-all: re-imported {lcsc_id} ({symbol_name})", flush=True)
+            else:
+                _UPDATE_STATE["failed"] += 1
+                _UPDATE_STATE["errors"].append(f"{lcsc_id}: {res.get('error', 'import failed')}")
+                print(f"[easyeda2kicad-server] update-all: FAILED {lcsc_id}: {res.get('error', '')}", flush=True)
+    # Final safety sweep: remove any orphan duplicates left by renamed symbols.
+    try:
+        with _LIB_LOCK:
+            _dedupe_lcsc_orphans(lib_path)
+    except Exception as exc:
+        print(f"[easyeda2kicad-server] update-all: final dedup failed: {exc}", flush=True)
+    with _UPDATE_LOCK:
+        _UPDATE_STATE["running"] = False
+        _UPDATE_STATE["current"] = ""
+        _UPDATE_STATE["finished_at"] = time.time()
+    print("[easyeda2kicad-server] update-all: finished", flush=True)
+
+
+def _start_update_all(lib_path):
+    """
+    Kick off a full re-import of every LCSC part as a background thread and return
+    immediately.  The dashboard/extension poll /update-progress for live status.
+    Re-running easyeda2kicad (--full --overwrite) regenerates each symbol,
+    footprint and 3D model and refreshes stock/price/class/description — so old
+    parts are upgraded to the current format.
+    """
+    if not get_easyeda2kicad():
+        return {"success": False, "error": "easyeda2kicad not found in PATH"}
     if not os.path.isfile(lib_path):
         return {"success": False, "error": f"Library not found: {lib_path}"}
 
-    symbols = _find_lcsc_symbols(lib_path)
+    with _UPDATE_LOCK:
+        if _UPDATE_STATE["running"]:
+            snap = dict(_UPDATE_STATE)
+            snap["success"] = True
+            snap["already_running"] = True
+            return snap
+
+    try:
+        symbols = _find_lcsc_symbols(lib_path)
+    except PermissionError:
+        return {"success": False, "error": "permission_denied",
+                "hint": "Grant Full Disk Access to the Python running this server."}
+
+    # Collapse duplicate LCSC ids (orphans) so each part is re-imported once.
+    seen, uniq = set(), []
+    for name, lcsc in symbols:
+        if lcsc not in seen:
+            seen.add(lcsc)
+            uniq.append((name, lcsc))
+    symbols = uniq
+
     if not symbols:
-        return {"success": True, "updated": 0, "failed": 0, "total": 0,
+        return {"success": True, "started": False, "total": 0,
                 "message": "No LCSC symbols found."}
 
-    updated = 0
-    failed  = 0
-    errors  = []
+    with _UPDATE_LOCK:
+        _UPDATE_STATE.update(running=True, total=len(symbols), done=0, updated=0,
+                             failed=0, current="", errors=[],
+                             started_at=time.time(), finished_at=None)
 
-    for symbol_name, lcsc_id in symbols:
-        part_info = _fetch_lcsc_part_info(lcsc_id)
-        if not part_info:
-            failed += 1
-            errors.append(f"{lcsc_id}: not found in LCSC API")
+    threading.Thread(target=_run_update_all, args=(lib_path, symbols), daemon=True).start()
+    return {"success": True, "started": True, "total": len(symbols)}
+
+
+# ---------------------------------------------------------------------------
+# Library parts listing (for the dashboard "monitor parts" view)
+# ---------------------------------------------------------------------------
+
+def _unescape_sexpr(s):
+    """Undo KiCad s-expression string escaping ( \\" -> " , \\\\ -> \\ )."""
+    out, i, n = [], 0, len(s)
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            out.append(s[i + 1])
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def _sym_properties(block):
+    """Return {name: value} for every (property "name" "value" ...) in a block."""
+    props = {}
+    pat = re.compile(r'\(property\s+"((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"')
+    for m in pat.finditer(block):
+        k = _unescape_sexpr(m.group(1))
+        v = _unescape_sexpr(m.group(2))
+        if k not in props:
+            props[k] = v
+    return props
+
+
+def _list_library_parts(lib_path):
+    """
+    Return a list of dicts describing every top-level symbol in the library
+    that carries an LCSC/JLCPCB part number, with its tracked fields.
+    """
+    try:
+        content = _read_lib(lib_path)
+    except Exception:
+        return []
+
+    parts   = []
+    for name, line_start, paren, end in _iter_top_symbols(content):
+        props = _sym_properties(content[paren:end])
+        lcsc  = _lcsc_of(props)
+        if not lcsc:
             continue
+        fp = props.get("Footprint", "")
+        parts.append({
+            "name":        name,
+            "lcsc":        lcsc,
+            "value":       props.get("Value", name),
+            "description": props.get("Description", ""),
+            "footprint":   fp.split(":", 1)[1] if ":" in fp else fp,
+            "stock":       props.get("In Stock", ""),
+            "price":       props.get("Unit Price", ""),
+            "jlcpcb_class": props.get("JLCPCB Class", ""),
+            "updated":     props.get("Stock Update Date", ""),
+            "datasheet":   props.get("Datasheet", ""),
+        })
 
-        add_symbol_fields(
-            lib_path,
-            symbol_name,
-            description="",  # don't overwrite user-set descriptions
-            in_stock=str(part_info.get("stock", "")),
-            price=part_info.get("price_str", ""),
-            jlcpcb_class=part_info.get("jlcpcb_class", ""),
-        )
-        updated += 1
-        print(f"[easyeda2kicad-server] update-all: {lcsc_id} ({symbol_name})", flush=True)
+    parts.sort(key=lambda p: p["name"].lower())
+    return parts
 
-    return {
-        "success": True,
-        "updated": updated,
-        "failed":  failed,
-        "total":   len(symbols),
-        "errors":  errors,
+
+# ---------------------------------------------------------------------------
+# KiCad project → JLCPCB SMT BOM
+# ---------------------------------------------------------------------------
+
+_LCSC_ID_RE   = re.compile(r'^C\d{3,}$')
+# Property names that may hold an LCSC/JLCPCB part number, in priority order.
+_PART_FIELD_NAMES = ["JLCPCB Part #", "LCSC Part #", "LCSC Part", "LCSC"]
+
+
+def _match_block(text, open_idx):
+    """Given the index of a '(', return the index just past its matching ')'."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == '\\':
+                    i += 1
+                i += 1
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _strip_lib_symbols(text):
+    """Remove the (lib_symbols ...) cache so only placed instances remain."""
+    m = re.search(r'\(lib_symbols\b', text)
+    if not m:
+        return text
+    return text[:m.start()] + text[_match_block(text, m.start()):]
+
+
+def _lcsc_of(props):
+    """Pick the LCSC part number out of a symbol's properties."""
+    for name in _PART_FIELD_NAMES:
+        v = (props.get(name) or "").strip()
+        if _LCSC_ID_RE.match(v):
+            return v
+    for v in props.values():
+        v = (v or "").strip()
+        if _LCSC_ID_RE.match(v):
+            return v
+    return ""
+
+
+def _instance_refs(block, ref_prop):
+    """Actual designators from the (instances ...) sub-block, else the Reference property."""
+    refs = []
+    im = re.search(r'\(instances\b', block)
+    if im:
+        inst = block[im.start():_match_block(block, im.start())]
+        refs = re.findall(r'\(reference\s+"([^"]+)"', inst)
+    if not refs and ref_prop:
+        refs = [ref_prop]
+    seen, out = set(), []
+    for r in refs:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _natkey(ref):
+    m = re.match(r'([A-Za-z_]+)(\d+)', ref)
+    return (m.group(1), int(m.group(2))) if m else (ref, 0)
+
+
+def _parse_project_components(project_path):
+    """Parse every placed component out of a KiCad project's schematics."""
+    proj_dir = os.path.dirname(project_path) if os.path.isfile(project_path) else project_path
+    sch_files = sorted(glob.glob(os.path.join(proj_dir, "*.kicad_sch")))
+
+    comps = []
+    for sch in sch_files:
+        try:
+            with open(sch, encoding="utf-8") as f:
+                text = _strip_lib_symbols(f.read())
+        except Exception:
+            continue
+        for m in re.finditer(r'(?m)^[ \t]+(\(symbol)\b', text):
+            block = text[m.start(1):_match_block(text, m.start(1))]
+            libm  = re.search(r'\(lib_id\s+"([^"]+)"', block)
+            lib_id = libm.group(1) if libm else ""
+            if lib_id.startswith("power:"):
+                continue
+            props = _sym_properties(block)
+            refs  = [r for r in _instance_refs(block, props.get("Reference", ""))
+                     if not r.startswith("#")]
+            if not refs:
+                continue
+            fp = props.get("Footprint", "")
+            comps.append({
+                "refs":      refs,
+                "value":     props.get("Value", ""),
+                "footprint": fp.split(":", 1)[1] if ":" in fp else fp,
+                "lcsc":      _lcsc_of(props),
+                "dnp":       "(dnp yes)" in block,
+                "in_bom":    "(in_bom no)" not in block,
+            })
+    return comps
+
+
+def _build_bom(project_path, include_dnp=False):
+    """Return grouped JLCPCB BOM rows for a KiCad project."""
+    comps  = _parse_project_components(project_path)
+    groups = {}
+    for c in comps:
+        if not c["in_bom"] or (c["dnp"] and not include_dnp) or not c["footprint"]:
+            continue
+        key = c["lcsc"] or f'{c["value"]}|{c["footprint"]}'
+        g = groups.setdefault(key, {"comment": c["value"], "footprint": c["footprint"],
+                                    "lcsc": c["lcsc"], "refs": []})
+        g["refs"].extend(c["refs"])
+
+    rows = []
+    for g in groups.values():
+        refs = sorted(set(g["refs"]), key=_natkey)
+        rows.append({
+            "comment":    g["comment"],
+            "designator": ",".join(refs),
+            "footprint":  g["footprint"],
+            "lcsc":       g["lcsc"],
+            "qty":        len(refs),
+        })
+    # LCSC-less rows sink to the bottom; otherwise sort by first designator.
+    rows.sort(key=lambda r: (r["lcsc"] == "", _natkey(r["designator"].split(",")[0])))
+    return rows
+
+
+BOM_HEADERS = ["Comment", "Designator", "Footprint", "JLCPCB Part #（optional）"]
+
+
+def _bom_csv(rows):
+    import csv, io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(BOM_HEADERS)
+    for r in rows:
+        w.writerow([r["comment"], r["designator"], r["footprint"], r["lcsc"]])
+    return buf.getvalue()
+
+
+def _bom_xlsx(rows):
+    """Return xlsx bytes matching the JLCPCB SMT BOM template, or None if openpyxl missing."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font
+    except Exception:
+        return None
+    import io
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    ws.append(BOM_HEADERS)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for r in rows:
+        ws.append([r["comment"], r["designator"], r["footprint"], r["lcsc"]])
+    widths = [26, 30, 34, 18]
+    for i, wdt in enumerate(widths, start=1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = wdt
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _sanitize_filename(name):
+    return re.sub(r'[^A-Za-z0-9._-]+', "_", name).strip("_") or "bom"
+
+
+# ---------------------------------------------------------------------------
+# Project discovery
+# ---------------------------------------------------------------------------
+
+def _list_projects():
+    """Find KiCad projects (.kicad_pro) under the user's common project folders."""
+    roots = [
+        os.path.expanduser("~/Documents/KiCad/projects"),
+        os.path.expanduser("~/Documents/Kicad/projects"),
+        os.path.expanduser("~/Documents/KiCad"),
+        os.path.expanduser("~/Documents/Kicad"),
+    ]
+    found, seen = [], set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for pro in glob.glob(os.path.join(root, "**", "*.kicad_pro"), recursive=True):
+            rp = os.path.realpath(pro)
+            if rp in seen:
+                continue
+            seen.add(rp)
+            home = os.path.expanduser("~")
+            reldir = os.path.dirname(rp)
+            try:
+                reldir = os.path.relpath(reldir, home)
+            except Exception:
+                pass
+            found.append({
+                "name":   os.path.splitext(os.path.basename(pro))[0],
+                "folder": reldir,
+                "path":   pro,
+            })
+    found.sort(key=lambda p: (p["name"].lower(), p["folder"].lower()))
+    return found
+
+
+def _safe_under_home(path):
+    """Guard against path traversal: only allow reads under the user's home dir."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    rp   = os.path.realpath(os.path.expanduser(path or ""))
+    return rp == home or rp.startswith(home + os.sep), rp
+
+
+# ---------------------------------------------------------------------------
+# Dashboard web page
+# ---------------------------------------------------------------------------
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>easyeda2kicad — Dashboard</title>
+<style>
+  :root {
+    --green:#2d6a4f; --green-d:#1b4332; --blue:#1a5276; --red:#9b2226;
+    --bg:#f4f6f5; --card:#fff; --line:#e3e8e6; --muted:#6b7772; --text:#1a1f1d;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg);
+         color:var(--text); font-size:14px; line-height:1.5; }
+  header { background:var(--green); color:#fff; padding:18px 24px; display:flex;
+           align-items:center; gap:14px; box-shadow:0 1px 4px rgba(0,0,0,.15); }
+  header h1 { font-size:18px; font-weight:700; letter-spacing:.01em; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#f1c40f; }
+  header .dot.online { background:#2ecc71; } header .dot.offline { background:#e74c3c; }
+  header .srv { font-size:12px; opacity:.85; }
+  main { max-width:1180px; margin:22px auto; padding:0 20px; display:flex; flex-direction:column; gap:22px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          box-shadow:0 1px 2px rgba(0,0,0,.04); overflow:hidden; }
+  .card h2 { font-size:14px; font-weight:700; padding:13px 18px; border-bottom:1px solid var(--line);
+             display:flex; align-items:center; gap:10px; }
+  .card h2 .count { color:var(--muted); font-weight:600; font-size:12px; }
+  .card .body { padding:16px 18px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:1px; background:var(--line); }
+  .stats .cell { background:var(--card); padding:14px 18px; }
+  .stats .cell .k { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  .stats .cell .v { font-size:19px; font-weight:700; margin-top:3px; }
+  .v.online { color:var(--green); } .v.offline { color:var(--red); }
+  button { font-family:inherit; font-size:13px; font-weight:600; border:none; border-radius:6px;
+           padding:8px 14px; cursor:pointer; transition:background .15s, opacity .15s; }
+  button.primary { background:var(--green); color:#fff; } button.primary:hover { background:var(--green-d); }
+  button.ghost { background:#eef2f0; color:var(--green-d); } button.ghost:hover { background:#e2e8e5; }
+  button.mini { padding:4px 10px; font-size:12px; }
+  button:disabled { opacity:.55; cursor:default; }
+  input, select { font-family:inherit; font-size:13px; padding:8px 10px; border:1px solid #cfd6d3;
+                  border-radius:6px; background:#fff; color:var(--text); outline:none; }
+  input:focus, select:focus { border-color:var(--green); }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; min-width:120px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); background:#fafbfb;
+       position:sticky; top:0; z-index:1; }
+  tbody tr:hover { background:#f7faf8; }
+  .scroll { max-height:460px; overflow:auto; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; }
+  .pill.warn { background:#fdecea; color:var(--red); } .pill.ok { background:#e6f4ec; color:var(--green-d); }
+  .mono { font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:12px; }
+  .msg { font-size:12px; color:var(--muted); min-height:16px; }
+  .msg.ok { color:var(--green-d); } .msg.err { color:var(--red); }
+  a.dl { text-decoration:none; }
+  .muted { color:var(--muted); }
+  .desc { max-width:340px; color:var(--muted); font-size:12px; }
+  .nowrap { white-space:nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="srv-dot"></span>
+  <h1>easyeda2kicad</h1>
+  <span class="srv" id="srv-text">connecting…</span>
+</header>
+
+<main>
+  <!-- Library status -->
+  <section class="card">
+    <h2>Library Status
+      <button class="ghost mini" style="margin-left:auto" onclick="loadStatus()">↻ Refresh</button>
+    </h2>
+    <div class="stats" id="stats"><div class="cell"><div class="k">Loading</div><div class="v">…</div></div></div>
+  </section>
+
+  <!-- Parts monitor -->
+  <section class="card">
+    <h2>Parts <span class="count" id="parts-count"></span>
+      <button class="primary mini" style="margin-left:auto" id="btn-update-all" onclick="updateAll()">Update All Parts</button>
+    </h2>
+    <div class="body">
+      <div class="row" style="margin-bottom:12px">
+        <input class="grow" id="parts-filter" placeholder="Filter by name, value, LCSC #, description…" oninput="renderParts()">
+        <span class="msg" id="update-msg"></span>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr>
+            <th>Name</th><th>Value</th><th>JLCPCB Part #</th><th>Footprint</th>
+            <th class="nowrap">In Stock</th><th>Price</th><th>Class</th><th class="nowrap">Updated</th><th></th>
+          </tr></thead>
+          <tbody id="parts-body"><tr><td colspan="9" class="muted">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- BOM -->
+  <section class="card">
+    <h2>JLCPCB SMT BOM</h2>
+    <div class="body">
+      <div class="row" style="margin-bottom:8px">
+        <select class="grow" id="bom-project"><option value="">Loading projects…</option></select>
+        <button class="ghost mini" onclick="loadProjects()">↻</button>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <input class="grow mono" id="bom-path" placeholder="…or paste a .kicad_pro / project folder path">
+        <label class="muted" style="font-size:12px"><input type="checkbox" id="bom-dnp"> include DNP</label>
+        <button class="primary" onclick="genBom()">Generate BOM</button>
+      </div>
+      <div class="msg" id="bom-msg"></div>
+      <div id="bom-summary" style="margin:8px 0; display:none" class="row">
+        <span id="bom-stats" class="muted"></span>
+        <button class="ghost mini" onclick="dlBom('xlsx')">⬇ Download .xlsx</button>
+        <button class="ghost mini" onclick="dlBom('csv')">⬇ Download .csv</button>
+      </div>
+      <div class="scroll" id="bom-wrap" style="display:none">
+        <table>
+          <thead><tr><th>Comment</th><th>Designator</th><th>Footprint</th><th>JLCPCB Part #</th><th class="nowrap">Qty</th></tr></thead>
+          <tbody id="bom-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let PARTS = [];
+let BOM_QUERY = "";
+
+function dlBom(fmt){
+  if (!BOM_QUERY) return;
+  const a = document.createElement("a");
+  a.href = "/bom." + fmt + "?" + BOM_QUERY;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function esc(s){ return (s==null?"":String(s)).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ── status ──────────────────────────────────────────────────────────────
+async function loadStatus(){
+  try {
+    const d = await (await fetch("/status")).json();
+    $("srv-dot").className = "dot online"; $("srv-text").textContent = "server online · " + (d.lib_path||"");
+    if (d.error === "permission_denied") {
+      $("stats").innerHTML = `<div class="cell" style="grid-column:1/-1">
+        <div class="k" style="color:var(--red)">⚠ No access to your library</div>
+        <div style="margin-top:6px;font-size:13px">${esc(d.hint||"")}</div></div>`;
+      return;
     }
+    $("stats").innerHTML = [
+      ["Server", "Online", "online"],
+      ["Library", d.library_found ? "Found":"Not found", d.library_found?"":"offline"],
+      ["Total Symbols", d.total_symbols||0, ""],
+      ["Tracked Parts", d.lcsc_symbols||0, ""],
+      ["Last Modified", d.last_modified||"—", ""],
+    ].map(([k,v,c])=>`<div class="cell"><div class="k">${k}</div><div class="v ${c}">${esc(v)}</div></div>`).join("");
+  } catch(e){
+    $("srv-dot").className="dot offline"; $("srv-text").textContent="server offline";
+    $("stats").innerHTML = `<div class="cell"><div class="k">Server</div><div class="v offline">Offline</div></div>`;
+  }
+}
+
+// ── parts ───────────────────────────────────────────────────────────────
+async function loadParts(){
+  try {
+    const d = await (await fetch("/parts")).json();
+    PARTS = d.parts||[]; renderParts();
+  } catch(e){ $("parts-body").innerHTML = `<tr><td colspan="9" class="muted">Could not load parts.</td></tr>`; }
+}
+function renderParts(){
+  const q = $("parts-filter").value.trim().toLowerCase();
+  const rows = PARTS.filter(p => !q ||
+    (p.name+" "+p.value+" "+p.lcsc+" "+p.description).toLowerCase().includes(q));
+  $("parts-count").textContent = `(${rows.length}${q?" of "+PARTS.length:""})`;
+  if (!rows.length){ $("parts-body").innerHTML = `<tr><td colspan="9" class="muted">No parts.</td></tr>`; return; }
+  $("parts-body").innerHTML = rows.map(p => `
+    <tr data-lcsc="${esc(p.lcsc)}">
+      <td class="mono">${esc(p.name)}<div class="desc">${esc(p.description)}</div></td>
+      <td>${esc(p.value)}</td>
+      <td class="mono">${esc(p.lcsc)}</td>
+      <td class="mono muted">${esc(p.footprint)}</td>
+      <td class="nowrap">${esc(p.stock||"—")}</td>
+      <td class="nowrap">${esc(p.price||"—")}</td>
+      <td>${esc(p.jlcpcb_class||"—")}</td>
+      <td class="nowrap muted">${esc(p.updated||"—")}</td>
+      <td><button class="ghost mini" onclick="updateOne(this,'${esc(p.lcsc)}')">Update</button></td>
+    </tr>`).join("");
+}
+async function updateOne(btn, lcsc){
+  btn.disabled = true; btn.textContent = "…";
+  try {
+    const d = await (await fetch("/import?lcsc_id="+encodeURIComponent(lcsc))).json();
+    btn.textContent = d.success ? "✓" : "✗";
+    if (d.success){ await loadParts(); await loadStatus(); }
+  } catch(e){ btn.textContent = "✗"; }
+  setTimeout(()=>{ btn.disabled=false; btn.textContent="Update"; }, 1500);
+}
+let UPDATE_POLL = null;
+
+async function updateAll(){
+  const btn = $("btn-update-all"), msg = $("update-msg");
+  btn.disabled = true; btn.textContent = "Updating…";
+  msg.className = "msg"; msg.textContent = "Starting…";
+  try {
+    const d = await (await fetch("/update-all")).json();
+    if (!d.success){ msg.className="msg err"; msg.textContent = "✗ "+(d.error||"failed"); btn.disabled=false; btn.textContent="Update All Parts"; return; }
+    if (d.started === false){ msg.className="msg ok"; msg.textContent = d.message||"Nothing to update"; btn.disabled=false; btn.textContent="Update All Parts"; return; }
+    pollUpdate();  // begin polling progress
+  } catch(e){
+    msg.className="msg err"; msg.textContent="✗ server offline";
+    btn.disabled=false; btn.textContent="Update All Parts";
+  }
+}
+
+function pollUpdate(){
+  const btn = $("btn-update-all"), msg = $("update-msg");
+  if (UPDATE_POLL) clearInterval(UPDATE_POLL);
+  const tick = async () => {
+    let p;
+    try { p = await (await fetch("/update-progress")).json(); }
+    catch(e){ return; }
+    const pct = p.total ? Math.round(100*p.done/p.total) : 0;
+    if (p.running){
+      btn.disabled = true; btn.textContent = `Updating ${p.done}/${p.total}`;
+      msg.className = "msg";
+      msg.textContent = `${pct}% · ${p.done}/${p.total} done` +
+        (p.failed?` · ${p.failed} failed`:"") + (p.current?` · now: ${p.current}`:"");
+    } else {
+      clearInterval(UPDATE_POLL); UPDATE_POLL = null;
+      btn.disabled = false; btn.textContent = "Update All Parts";
+      if (p.total){
+        msg.className = "msg ok";
+        msg.textContent = `✓ Updated ${p.updated}/${p.total}` + (p.failed?` (${p.failed} failed)`:"");
+      } else { msg.className="msg"; msg.textContent=""; }
+      await loadParts(); await loadStatus();
+    }
+  };
+  tick();
+  UPDATE_POLL = setInterval(tick, 2000);
+}
+
+// If a job is already running when the page loads, resume showing progress.
+async function resumeUpdateIfRunning(){
+  try {
+    const p = await (await fetch("/update-progress")).json();
+    if (p.running) pollUpdate();
+  } catch(e){}
+}
+
+// ── projects + BOM ──────────────────────────────────────────────────────
+async function loadProjects(){
+  try {
+    const d = await (await fetch("/projects")).json();
+    const sel = $("bom-project");
+    sel.innerHTML = `<option value="">— select a KiCad project —</option>` +
+      (d.projects||[]).map(p=>{
+        const label = p.folder && p.folder!==p.name ? `${p.name} — ${p.folder}` : p.name;
+        return `<option value="${esc(p.path)}">${esc(label)}</option>`;
+      }).join("");
+  } catch(e){ $("bom-project").innerHTML = `<option value="">Could not load projects</option>`; }
+}
+$("bom-project") && $("bom-project").addEventListener("change", e => { if (e.target.value) $("bom-path").value = e.target.value; });
+
+async function genBom(){
+  const project = ($("bom-path").value.trim() || $("bom-project").value);
+  const dnp = $("bom-dnp").checked ? "1":"0";
+  const msg = $("bom-msg");
+  if (!project){ msg.className="msg err"; msg.textContent="Pick a project or paste a path first."; return; }
+  msg.className="msg"; msg.textContent="Parsing schematics…";
+  $("bom-summary").style.display="none"; $("bom-wrap").style.display="none";
+  try {
+    const url = "/bom?project="+encodeURIComponent(project)+"&include_dnp="+dnp;
+    const d = await (await fetch(url)).json();
+    if (!d.success){ msg.className="msg err"; msg.textContent="✗ "+(d.error||"failed"); return; }
+    msg.className="msg ok"; msg.textContent = `✓ ${d.name}`;
+    $("bom-stats").textContent = `${d.lines} lines · ${d.parts} parts` + (d.missing?` · ${d.missing} without LCSC #`:"");
+    BOM_QUERY = "project="+encodeURIComponent(project)+"&include_dnp="+dnp;
+    $("bom-body").innerHTML = d.rows.map(r=>`
+      <tr>
+        <td>${esc(r.comment)}</td>
+        <td class="mono" style="max-width:300px">${esc(r.designator)}</td>
+        <td class="mono muted">${esc(r.footprint)}</td>
+        <td class="mono">${r.lcsc ? esc(r.lcsc) : '<span class="pill warn">missing</span>'}</td>
+        <td>${r.qty}</td>
+      </tr>`).join("");
+    $("bom-summary").style.display="flex"; $("bom-wrap").style.display="block";
+  } catch(e){ msg.className="msg err"; msg.textContent="✗ "+e.message; }
+}
+
+// ── init ────────────────────────────────────────────────────────────────
+loadStatus(); loadParts(); loadProjects(); resumeUpdateIfRunning();
+setInterval(loadStatus, 30000);
+</script>
+</body>
+</html>
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -919,12 +1810,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
 
+        if parsed.path in ("/", "/dashboard"):
+            self._html(200, DASHBOARD_HTML)
+            return
+
         if parsed.path == "/status":
             self._json(200, _get_status(_default_lib_path()))
             return
 
+        if parsed.path == "/parts":
+            self._json(200, {
+                "success":  True,
+                "lib_path": _default_lib_path(),
+                "parts":    _list_library_parts(_default_lib_path()),
+            })
+            return
+
+        if parsed.path == "/projects":
+            self._json(200, {"success": True, "projects": _list_projects()})
+            return
+
         if parsed.path == "/update-all":
-            self._json(200, _update_all_symbols(_default_lib_path()))
+            self._json(200, _start_update_all(_default_lib_path()))
+            return
+
+        if parsed.path == "/update-progress":
+            self._json(200, _update_progress())
+            return
+
+        if parsed.path in ("/bom", "/bom.csv", "/bom.xlsx"):
+            self._handle_bom(parsed.path, params)
             return
 
         if parsed.path != "/import":
@@ -940,72 +1855,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"success": False, "error": "missing lcsc_id"})
             return
 
-        if not EASYEDA2KICAD:
-            self._json(500, {"success": False, "error": "easyeda2kicad not found in PATH"})
+        try:
+            result = _import_one(lcsc_id, description, in_stock)
+            # Surface the "broken install" case as a 500 like before.
+            if not result.get("success") and "installed but broken" in result.get("error", ""):
+                self._json(500, result)
+            else:
+                self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"success": False, "error": str(exc)})
+
+    def _handle_bom(self, path, params):
+        project = params.get("project", [""])[0]
+        include_dnp = params.get("include_dnp", ["0"])[0] in ("1", "true", "yes")
+
+        if not project:
+            self._json(400, {"success": False, "error": "missing project path"})
+            return
+
+        ok, real = _safe_under_home(project)
+        if not ok:
+            self._json(403, {"success": False, "error": "project path must be inside your home directory"})
+            return
+        if not os.path.exists(real):
+            self._json(404, {"success": False, "error": f"project not found: {project}"})
             return
 
         try:
-            result = subprocess.run(
-                [EASYEDA2KICAD, "--full", "--overwrite", f"--lcsc_id={lcsc_id}"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            success     = result.returncode == 0
-            symbol_name = parse_symbol_name(result.stderr)
-            lib_path    = parse_lib_path(result.stderr)
-
-            if success and symbol_name and lib_path:
-                # Normal path: easyeda2kicad succeeded.
-                # Deduplicate first (--overwrite appends, doesn't remove old entry).
-                _dedup_symbol(lib_path, symbol_name)
-
-                # Always fetch from LCSC API: stock from the browser is unreliable
-                # (it often picks up package codes like "0603" or MOQ values).
-                # Also use API description when the browser didn't scrape a real one.
-                price        = ""
-                jlcpcb_class = ""
-                part_info = _fetch_lcsc_part_info(lcsc_id)
-                if part_info:
-                    is_trivial = (
-                        not description or
-                        bool(re.match(r'^LCSC:\s*C\d+\s*$', description.strip())) or
-                        len(description.strip()) <= 5
-                    )
-                    if is_trivial and part_info.get("device_desc"):
-                        description = part_info["device_desc"]
-                    # Use API stock — it's always accurate
-                    if part_info.get("stock"):
-                        in_stock = str(part_info["stock"])
-                    price        = part_info.get("price_str", "")
-                    jlcpcb_class = part_info.get("jlcpcb_class", "")
-
-                add_symbol_fields(lib_path, symbol_name, description, in_stock, price, jlcpcb_class)
-                self._json(200, {
-                    "success":     True,
-                    "symbol_name": symbol_name,
-                    "lib_path":    lib_path,
-                    "stdout":      result.stdout,
-                    "stderr":      result.stderr,
-                })
-            else:
-                # easyeda2kicad failed — part likely not in EasyEDA's database.
-                # Try generating a minimal symbol directly from the LCSC Pro API.
-                print(
-                    f"[easyeda2kicad-server] easyeda2kicad failed for {lcsc_id}, "
-                    f"trying fallback import…",
-                    flush=True,
-                )
-                fb = fallback_import(lcsc_id, description, in_stock)
-                if not fb["success"]:
-                    # Surface the original easyeda2kicad error alongside the fallback error.
-                    fb["stderr"] = result.stderr + "\n\nFallback error: " + fb.get("error", "")
-                self._json(200, fb)
-
-        except subprocess.TimeoutExpired:
-            self._json(500, {"success": False, "error": "command timed out"})
+            rows = _build_bom(real, include_dnp=include_dnp)
         except Exception as exc:
-            self._json(500, {"success": False, "error": str(exc)})
+            self._json(500, {"success": False, "error": f"BOM parse failed: {exc}"})
+            return
+
+        base = os.path.splitext(os.path.basename(real))[0] or "project"
+        if os.path.isdir(real):
+            base = os.path.basename(os.path.realpath(real)) or "project"
+        fname = _sanitize_filename(f"BOM_{base}_JLCSMT")
+
+        if path == "/bom.csv":
+            self._download(_bom_csv(rows).encode("utf-8-sig"), fname + ".csv", "text/csv")
+            return
+        if path == "/bom.xlsx":
+            data = _bom_xlsx(rows)
+            if data is None:
+                self._download(_bom_csv(rows).encode("utf-8-sig"), fname + ".csv", "text/csv")
+                return
+            self._download(data, fname + ".xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            return
+
+        missing = sum(1 for r in rows if not r["lcsc"])
+        self._json(200, {
+            "success":   True,
+            "project":   real,
+            "name":      base,
+            "rows":      rows,
+            "lines":     len(rows),
+            "parts":     sum(r["qty"] for r in rows),
+            "missing":   missing,
+            "xlsx":      _bom_xlsx([]) is not None,
+        })
 
     def _json(self, code, body):
         payload = json.dumps(body).encode()
@@ -1016,12 +1925,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _html(self, code, body):
+        payload = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _download(self, data, filename, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(data)
+
     def log_message(self, fmt, *args):
         print(f"[easyeda2kicad-server] {fmt % args}", flush=True)
 
 
-class ReusableTCPServer(socketserver.TCPServer):
+class ReusableTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    # Threaded so a long "Update All" runs in its own thread while /status,
+    # /parts and the dashboard stay responsive.
     allow_reuse_address = True
+    daemon_threads = True
 
 
 if __name__ == "__main__":

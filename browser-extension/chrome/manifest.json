@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "easyeda2kicad",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Import LCSC components into KiCad directly from the browser",
   "action": {
     "default_popup": "popup.html",
-    "default_title": "easyeda2kicad — Component Search"
+    "default_title": "easyeda2kicad — LCSC → KiCad importer"
   },
   "background": {
     "service_worker": "background.js"
@@ -25,6 +25,7 @@
     "https://www.lcsc.com/*",
     "https://lcsc.com/*",
     "https://jlcpcb.com/*",
+    "http://127.0.0.1:7777/*",
     "http://localhost:7777/*"
   ],
   "permissions": []

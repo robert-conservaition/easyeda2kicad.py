@@ -740,33 +740,70 @@ function injectUpdateAllBar() {
   });
   closeBtn.addEventListener("click", () => bar.remove());
 
-  btn.addEventListener("click", () => {
-    btn.disabled = true;
-    btn.textContent = "Updating…";
-    statusSpan.textContent = "";
-
-    fetch("http://localhost:7777/update-all")
-      .then((r) => r.json())
-      .then((data) => {
-        btn.disabled = false;
-        if (data.success) {
-          btn.textContent = "✓ Done";
-          btn.style.background = "#155724";
-          statusSpan.textContent =
-            `Updated ${data.updated} / ${data.total} parts` +
-            (data.failed > 0 ? ` (${data.failed} failed)` : "");
-        } else {
-          btn.textContent = "✗ Failed";
-          btn.style.background = "#7f1d1d";
-          statusSpan.textContent = data.error || "Update failed";
-        }
-      })
-      .catch(() => {
+  // Poll /update-progress through the service worker until the job finishes.
+  function pollUpdateProgress() {
+    chrome.runtime.sendMessage({ type: "update-progress" }, (p) => {
+      if (chrome.runtime.lastError || !p) {
         btn.disabled = false;
         btn.textContent = "✗ Server offline";
         btn.style.background = "#7f1d1d";
-        statusSpan.textContent = "Is the server running?";
+        return;
+      }
+      if (p.running) {
+        const pct = p.total ? Math.round((100 * p.done) / p.total) : 0;
+        btn.textContent = `Updating ${p.done}/${p.total}`;
+        statusSpan.textContent =
+          `${pct}% done` + (p.failed ? ` · ${p.failed} failed` : "") +
+          (p.current ? ` · ${p.current}` : "");
+        setTimeout(pollUpdateProgress, 2000);
+      } else {
+        btn.disabled = false;
+        btn.textContent = "✓ Done";
+        btn.style.background = "#155724";
+        statusSpan.textContent =
+          `Updated ${p.updated} / ${p.total} parts` +
+          (p.failed > 0 ? ` (${p.failed} failed)` : "");
+      }
+    });
+  }
+
+  btn.addEventListener("click", () => {
+    btn.disabled = true;
+    btn.textContent = "Starting…";
+    statusSpan.textContent = "Re-importing every part — this runs in the background.";
+
+    // Route through the service worker (avoids page-context mixed-content /
+    // CORS issues and survives content-script teardown).
+    try {
+      chrome.runtime.sendMessage({ type: "update-all" }, (data) => {
+        if (chrome.runtime.lastError || !data) {
+          btn.disabled = false;
+          btn.textContent = "✗ Server offline";
+          btn.style.background = "#7f1d1d";
+          statusSpan.textContent = "Is the server running?";
+          return;
+        }
+        if (!data.success) {
+          btn.disabled = false;
+          btn.textContent = "✗ Failed";
+          btn.style.background = "#7f1d1d";
+          statusSpan.textContent = data.error || "Update failed";
+          return;
+        }
+        if (data.started === false) {
+          btn.disabled = false;
+          btn.textContent = "Update All in KiCad Library";
+          statusSpan.textContent = data.message || "Nothing to update.";
+          return;
+        }
+        pollUpdateProgress();
       });
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = "✗ Reload page";
+      btn.style.background = "#7f1d1d";
+      statusSpan.textContent = "Extension reloaded — refresh the page (F5).";
+    }
   });
 
   bar.appendChild(label);

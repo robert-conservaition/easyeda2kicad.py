@@ -1,159 +1,166 @@
-# easyeda2kicad v0.8.0
+# LCSC → KiCad Importer
 
-_________________
-[![PyPI version](https://badge.fury.io/py/easyeda2kicad.svg)](https://badge.fury.io/py/easyeda2kicad)
-[![License](https://img.shields.io/github/license/upesy/easyeda2kicad.py.svg)](https://pypi.org/project/isort/)
-[![Downloads](https://pepy.tech/badge/easyeda2kicad)](https://pepy.tech/project/easyeda2kicad)
-![Python versions](https://img.shields.io/pypi/pyversions/easyeda2kicad.svg)
-[![Git hook: pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Imports: isort](https://img.shields.io/badge/%20imports-isort-%231674b1?style=flat&labelColor=ef8336)](https://pycqa.github.io/isort/)
-[![security: bandit](https://img.shields.io/badge/security-bandit-yellow.svg)](https://github.com/PyCQA/bandit)
-_________________
+Find a part on [LCSC](https://www.lcsc.com/), click one button, and it's ready to place in any KiCad project: symbol, footprint, and 3D model, plus the JLCPCB part number, stock, and price. When the board is done, generate a BOM for JLCPCB assembly from a local dashboard.
 
+It has three pieces:
 
-A Python script that converts any electronic components from [EasyEDA](https://easyeda.com/) or [LCSC](https://www.lcsc.com/) to a Kicad library including **3D model** in color. This tool will speed up your PCB design workflow especially when using [JLCPCB SMT assembly services](https://jlcpcb.com/caa). **It supports library formats for both Kicad v6.x and Kicad v5.x.**
+- **Chrome extension:** adds an **Import to KiCad** button to `lcsc.com` and `jlcpcb.com/parts`
+- **Background server:** runs on your Mac at `http://127.0.0.1:7777`, does the import, and hosts the dashboard
+- **Shared KiCad library:** every part lands in `~/Documents/Kicad/easyeda2kicad/`, so it's available in all your projects
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/uPesy/easyeda2kicad.py/master/ressources/demo_symbol.png" width="500">
-</p>
-<div align="center">
-  <img src="https://raw.githubusercontent.com/uPesy/easyeda2kicad.py/master/ressources/demo_footprint.png" width="500">
-</div>
+This is a customized fork of [uPesy/easyeda2kicad.py](https://github.com/uPesy/easyeda2kicad.py). Install it from this repo, not with `pip install easyeda2kicad`: the PyPI version doesn't have these changes.
 
+## Set up on a new Mac
 
-## 🎆 Sponsor and Support
+You need a Mac with [KiCad](https://www.kicad.org/download/macos/) and Google Chrome installed. It takes about 10 minutes.
 
-If this tool has saved you a lot of time when designing a PCB, please consider supporting the project by :
-- Subscribing to uPesy Premium Membership to have access to high-quality electronics tutorials at https://www.upesy.com/products/subscription
-- Buying one of my ESP32 DevKit boards: https://www.upesy.com/pages/store
+### 1. Install Apple's command line tools
 
-<div align="center">
-<a href="https://www.upesy.com/" target="_blank"><img src="https://raw.githubusercontent.com/uPesy/easyeda2kicad.py/master/ressources/upesy_store.jpg" width="350"/></a>
-</div>
-
-## 💾 Installation
+This provides `git` and Python. If they're already installed, the command just tells you so.
 
 ```bash
-pip install easyeda2kicad
+xcode-select --install
 ```
 
-## 💻 Usage
+### 2. Download this project
 
 ```bash
-# For symbol + footprint + 3d model (with --full argument)
-easyeda2kicad --full --lcsc_id=C2040
-# For symbol + footprint + 3d model
-easyeda2kicad --symbol --footprint --3d --lcsc_id=C2040
-# For symbol + footprint
-easyeda2kicad --symbol --footprint --lcsc_id=C2040
-# For symbol only
-easyeda2kicad --symbol --lcsc_id=C2040
-# For footprint only
-easyeda2kicad --footprint --lcsc_id=C2040
-# For 3d model only
-easyeda2kicad --3d --lcsc_id=C2040
-# For symbol in Kicad v5.x legacy format
-easyeda2kicad --symbol --lcsc_id=C2040 --v5
+git clone https://github.com/robert-conservaition/easyeda2kicad.py.git ~/Documents/KiCad/easyeda2kicad.py
 ```
 
-By default, all librairies are saved in `C:/Users/your_name/Documents/Kicad/easyeda2kicad/`, with :
-- `easyeda2kicad.kicad_sym` file for Kicad v6.x symbol library
-- `easyeda2kicad.lib` file for Kicad v5.x legacy symbol library
-- `easyeda2kicad.pretty/` folder for footprint libraries
-- `easyeda2kicad.3dshapes/` folder for 3d models (in .WRL and .STEP format )
+### 3. Bring your parts library (optional)
 
-If you want to save components symbol/footprint in your own libs, you can specify the output lib path by using `--output` option.
+Your library isn't stored in GitHub. To keep your existing parts, copy this whole folder from your old computer to the same location on the new one:
+
+```text
+~/Documents/Kicad/easyeda2kicad/
+```
+
+Skip this step if you're starting fresh.
+
+### 4. Run the installer
 
 ```bash
-easyeda2kicad --full --lcsc_id=C2040 --output ~/libs/my_lib
+~/Documents/KiCad/easyeda2kicad.py/browser-extension/install.sh
 ```
 
-This command will save:
-- the symbol in `~/libs/my_lib.kicad_sym` file for symbol library. The file will be created if it doesn't exist.
-- the footprint in `~/libs/my_lib.pretty/` folder for footprint libraries. The folder will be created if it doesn't exist.
-- the 3d models in `~/libs/my_lib.3dshapes/` folder for 3d models. The folder will be created if it doesn't exist. The 3D models will be saved both in .WRL and .STEP format.
+The installer sets everything up and starts the server, which then starts by itself at every login.
 
-You can use the option `--overwrite` to update a component symbol/footprint that is already in a Kicad library (generated by easyeda2kicad)
+If it asks for **Full Disk Access**, follow the steps it prints. This is a one-time macOS permission that lets the background server use your library in `~/Documents`.
 
-```bash
-easyeda2kicad --symbol --footprint --lcsc_id=C2040 --output ~/libs/my_lib --overwrite
-```
+### 5. Add the Chrome extension
 
-By default, easyeda2kicad will generate a symbol library for Kicad v6.x (.kicad_sym). You can generate a symbol lib in legacy format for Kicad v5.x (.lib) using `--v5` argument.
-
-```bash
-easyeda2kicad --symbol --lcsc_id=C2040 --v5
-```
-
-## 🔗 Add libraries in Kicad
-
-**These are the instructions to add the default easyeda2kicad libraries in Kicad.**
-Before configuring KiCad, run the script at least once to create lib files. For example :
-
-```bash
-easyeda2kicad --symbol --footprint --lcsc_id=C2040
-```
-
-- In KiCad, Go to Preferences > Configure Paths, and add the environment variables `EASYEDA2KICAD` :
-  - Windows : `C:/Users/your_username/Documents/Kicad/easyeda2kicad/`,
-  - Linux : `/home/your_username/Documents/Kicad/easyeda2kicad/`
-- Go to Preferences > Manage Symbol Libraries, and Add the global library `easyeda2kicad` : `${EASYEDA2KICAD}/easyeda2kicad.kicad_sym`
-- Go to Preferences > Manage Footprint Libraries, and Add the global library `easyeda2kicad` : `${EASYEDA2KICAD}/easyeda2kicad.pretty`
-- Enjoy :wink:
-
-## Browser Extension (Chrome, macOS)
-
-A Chrome extension and companion background server allow you to import any LCSC component directly from the browser with a single click, without using the command line.
-
-### Prerequisites
-
-- macOS
-- easyeda2kicad installed (see Installation above)
-- Google Chrome
-- KiCad libraries configured as described in the "Add libraries in Kicad" section above
-
-### Install the background server
-
-The server runs silently in the background and starts automatically at login after a one-time setup.
-
-```bash
-cd browser-extension
-./install.sh
-```
-
-The script will:
-- Locate your `python3` and `easyeda2kicad` executables
-- Copy the server to `~/.easyeda2kicad/server.py`
-- Install a launchd agent (`~/Library/LaunchAgents/com.easyeda2kicad.server.plist`) so the server starts at every login
-- Start the server immediately on port 7777
-
-To uninstall the server:
-
-```bash
-cd browser-extension
-./uninstall.sh
-```
-
-### Install the Chrome extension
-
-1. Open Chrome and navigate to `chrome://extensions`
-2. Enable **Developer mode** using the toggle in the top-right corner
+1. Go to `chrome://extensions`
+2. Turn on **Developer mode** (top right)
 3. Click **Load unpacked**
-4. Select the `browser-extension/chrome` directory from this repository
+4. Press **⌘⇧G**, enter `~/Documents/KiCad/easyeda2kicad.py/browser-extension/chrome`, and click **Select**
 
-The extension requires no further configuration.
+### 6. Connect the library to KiCad
 
-### Usage
+Do this once. In KiCad's project window, open the **KiCad** menu → **Preferences**.
 
-Browse `lcsc.com` as normal. On any component page, a green **Import to KiCad** button appears next to the part name. Click it to import the symbol, footprint, and 3D model into your KiCad library.
+1. **Configure Paths:** add a row named `EASYEDA2KICAD` with the path `/Users/YOUR_NAME/Documents/Kicad/easyeda2kicad`
+2. **Manage Symbol Libraries:** on the **Global Libraries** tab, add a row with the nickname `easyeda2kicad` and the path `${EASYEDA2KICAD}/easyeda2kicad.kicad_sym`
+3. **Manage Footprint Libraries:** on the **Global Libraries** tab, add a row with the nickname `easyeda2kicad` and the path `${EASYEDA2KICAD}/easyeda2kicad.pretty`
 
-On search and category pages, a compact **→ KiCad** button appears inline with each result.
+The nickname must be exactly `easyeda2kicad`. To confirm it all works, open http://127.0.0.1:7777/ and check that the dashboard shows your parts with no warning.
 
-On a successful import, a notification displays the exact KiCad symbol name with a copy button. Paste the symbol name directly into the KiCad symbol chooser to place the component.
+## Add a part to a project
 
-The imported files are written to the same default library path used by the command-line tool (`~/Documents/Kicad/easyeda2kicad/`), so no additional KiCad configuration is required.
+### 1. Find it on LCSC
 
-## 🔥 Important Notes
-### WARRANTY
-The correctness of the symbols and footprints converted by easyeda2kicad can't be guaranteed. Easyeda2kicad speeds up custom library design process, but you should remain careful and always double check the footprints and symbols generated.
+Search [lcsc.com](https://www.lcsc.com/) as usual. Check stock, price, and whether JLCPCB can assemble it.
+
+### 2. Import it
+
+- On a **product page**, click the green **Import to KiCad** button by the part name.
+- On a **search or category page**, click the small **→ KiCad** button on the part's row.
+
+The same buttons appear on `jlcpcb.com/parts`. When the import finishes, a message shows the KiCad symbol name with a copy button.
+
+### 3. Place it in your schematic
+
+1. Copy the symbol name from that message
+2. In the KiCad schematic editor, press **A**
+3. Paste the name, choose the part, and place it
+
+If KiCad was already open and the part doesn't appear, close and reopen the schematic.
+
+### 4. Lay it out
+
+In the PCB editor, choose **Tools → Update PCB from Schematic** (**F8**). The footprint and 3D model come with the part.
+
+Always check the footprint and pinout against the datasheet before ordering. Converted parts can contain mistakes.
+
+### 5. Order from JLCPCB
+
+1. Open the dashboard at http://127.0.0.1:7777/
+2. Under **JLCPCB SMT BOM**, choose your project
+3. Download the `.xlsx` or `.csv` and upload it to JLCPCB assembly
+
+Any parts without a JLCPCB number are flagged so you can fix them first.
+
+## The dashboard
+
+The dashboard is at http://127.0.0.1:7777/.
+
+- **Library status:** whether the server is healthy, and how many parts you have
+- **Parts monitor:** search every part, see its stock, price, and class, and refresh one part with **Update**
+- **Update All Parts:** re-import everything to refresh stock and pricing, with a live progress bar
+- **JLCPCB SMT BOM:** generate an assembly BOM for a project in `~/Documents/KiCad`, or paste a project path
+
+The extension's toolbar icon opens a smaller version with library status, **Update All Parts**, and an LCSC category menu.
+
+## Get the latest version
+
+```bash
+cd ~/Documents/KiCad/easyeda2kicad.py && git pull && browser-extension/install.sh
+```
+
+Then go to `chrome://extensions` and click the reload icon on the **easyeda2kicad** card. Your parts library isn't affected.
+
+## Troubleshooting
+
+| What you see | What to do |
+| --- | --- |
+| **✗ Server offline**, or the dashboard won't load | Restart the server (below). If that doesn't help, run `install.sh` again. |
+| "No access to your KiCad library" | In System Settings → Privacy & Security → **Full Disk Access**, make sure `python3` is on. Then restart the server. |
+| No import button on LCSC | Reload the extension at `chrome://extensions`, then refresh the page. |
+| "Extension context invalidated" | Refresh the LCSC page. |
+| **✗ Failed** on one part | The part may not be in EasyEDA's database, or the connection dropped. Try again, then check the log (below). |
+| Part isn't in KiCad's chooser | Check step 6 of setup, then close and reopen the schematic. |
+| 3D model is missing | Check that the `EASYEDA2KICAD` path in step 6 is correct. |
+
+Restart the server:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.easyeda2kicad.server
+```
+
+Read the server log:
+
+```bash
+tail -50 /tmp/easyeda2kicad-server.log
+```
+
+Uninstall the server and extension support (your parts library is kept):
+
+```bash
+~/Documents/KiCad/easyeda2kicad.py/browser-extension/uninstall.sh
+```
+
+## Command line
+
+The installer also includes the original command line tool:
+
+```bash
+~/.easyeda2kicad/venv/bin/easyeda2kicad --full --lcsc_id=C2040
+```
+
+Add `--overwrite` to replace a part that's already in the library, or `--output ~/libs/my_lib` to write to a different library.
+
+## License
+
+AGPL-3.0, the same as the [original project](https://github.com/uPesy/easyeda2kicad.py) by uPesy. See [LICENSE](LICENSE).
+
+There's no guarantee that converted symbols and footprints are correct, so always verify them before ordering boards.
