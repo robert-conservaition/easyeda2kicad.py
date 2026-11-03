@@ -16,6 +16,7 @@ import re
 import shutil
 import socketserver
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -58,24 +59,51 @@ def _easyeda2kicad_works(path):
 
 
 def find_easyeda2kicad():
+    """
+    Locate a working easyeda2kicad executable, cross-platform.
+
+    Order: PATH, then next to the running Python interpreter (so a server
+    launched with a venv's python finds that venv's easyeda2kicad even when the
+    venv isn't on PATH — the normal case on Windows), then the dedicated
+    ~/.easyeda2kicad/venv the installer creates, then common install locations.
+    """
+    is_win = os.name == "nt"
+    exe    = "easyeda2kicad.exe" if is_win else "easyeda2kicad"
+
     candidates = []
-    found = shutil.which("easyeda2kicad")
-    if found:
-        candidates.append(found)
-    candidates.extend([
+    for name in ("easyeda2kicad", exe):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+
+    # Beside the interpreter running this server: venv/Scripts (Windows) or
+    # venv/bin (Unix).
+    py_dir = os.path.dirname(os.path.abspath(sys.executable))
+    candidates += [
+        os.path.join(py_dir, exe),
+        os.path.join(py_dir, "Scripts", exe),
+        os.path.join(py_dir, "bin", exe),
+    ]
+
+    # The dedicated venv the installer creates.
+    venv = os.path.expanduser("~/.easyeda2kicad/venv")
+    candidates += [
+        os.path.join(venv, "Scripts", exe),
+        os.path.join(venv, "bin", exe),
+    ]
+
+    # Repo-local venv and common Unix install locations.
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates += [
+        os.path.join(repo, ".venv", "Scripts", exe),
+        os.path.join(repo, ".venv", "bin", exe),
         os.path.expanduser("~/miniconda3/bin/easyeda2kicad"),
         os.path.expanduser("~/anaconda3/bin/easyeda2kicad"),
         os.path.expanduser("~/.local/bin/easyeda2kicad"),
         "/usr/local/bin/easyeda2kicad",
         "/opt/homebrew/bin/easyeda2kicad",
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..",
-            ".venv",
-            "bin",
-            "easyeda2kicad",
-        ),
-    ])
+    ]
+
     seen = set()
     for c in candidates:
         c = os.path.abspath(c)
