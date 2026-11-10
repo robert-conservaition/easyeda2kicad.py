@@ -65,13 +65,17 @@ echo "    server copied to: $SERVER_DEST"
 # ── 4. create the output library directory ────────────────────────────────────
 # A first import creates the library files KiCad needs to be pointed at. It runs
 # here, in Terminal, because the background server may not have access yet.
-LIB_DIR="$HOME/Documents/Kicad/easyeda2kicad"
-if [ ! -f "$LIB_DIR/easyeda2kicad.kicad_sym" ]; then
+# If ~/.easyeda2kicad/config.json names a library (e.g. a team hardware repo),
+# use it; otherwise fall back to the original ~/Documents/Kicad location.
+LIB_BASE="$("$VENV_DIR/bin/python" -c 'from easyeda2kicad.user_config import load_user_config as c; print(c().get("library") or "")')"
+[ -n "$LIB_BASE" ] || LIB_BASE="$HOME/Documents/Kicad/easyeda2kicad/easyeda2kicad"
+LIB_BASE="${LIB_BASE%.kicad_sym}"
+if [ ! -f "$LIB_BASE.kicad_sym" ]; then
   echo "    creating library with a first part (C2040)…"
   "$EASYEDA" --full --lcsc_id=C2040 > /dev/null 2>&1 \
     || echo "    (first import failed — check your internet connection)"
 fi
-echo "    KiCad library: $LIB_DIR"
+echo "    KiCad library: $(dirname "$LIB_BASE")"
 
 # ── 5. write launchd plist ────────────────────────────────────────────────────
 mkdir -p "$HOME/Library/LaunchAgents"

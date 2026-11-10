@@ -254,9 +254,12 @@ def _dedup_symbol(sym_path, symbol_name):
         print(f"[easyeda2kicad-server] warning: dedup failed: {e}", flush=True)
 
 
-def add_symbol_fields(sym_path, symbol_name, description, in_stock, price="", jlcpcb_class=""):
+def add_symbol_fields(sym_path, symbol_name, description, in_stock, price="", jlcpcb_class="",
+                      manufacturer="", mpn=""):
     """
     Add/update In Stock and Stock Update Date on an easyeda2kicad-generated symbol.
+    Also writes Manufacturer and MPN (manufacturer part number) when known, so the
+    BOM works for distributors other than JLCPCB (Digi-Key, Mouser, PCBWay, ...).
     Also updates the Description field only when the browser supplied something
     meaningful (not just the 'LCSC: Cxxxxxx' last-resort fallback).
 
@@ -288,6 +291,10 @@ def add_symbol_fields(sym_path, symbol_name, description, in_stock, price="", jl
 
         # Strip old/existing versions of every field we're about to re-write.
         fields_to_remove = ["ki_description", "In Stock", "Unit Price", "JLCPCB Class", "Stock Update Date"]
+        if manufacturer:
+            fields_to_remove.append("Manufacturer")
+        if mpn:
+            fields_to_remove.append("MPN")
         if desc_is_useful:
             fields_to_remove.append("Description")
 
@@ -313,6 +320,10 @@ def add_symbol_fields(sym_path, symbol_name, description, in_stock, price="", jl
             props.append(_prop_kicad7("Unit Price", price))
         if jlcpcb_class:
             props.append(_prop_kicad7("JLCPCB Class", jlcpcb_class))
+        if manufacturer:
+            props.append(_prop_kicad7("Manufacturer", manufacturer))
+        if mpn:
+            props.append(_prop_kicad7("MPN", mpn))
         props.append(_prop_kicad7("Stock Update Date", today_str))
 
         content = content[:insert_pos] + "".join(props) + content[insert_pos:]
@@ -669,7 +680,27 @@ def _fetch_lcsc_part_info(lcsc_id):
     }
 
 
+def _user_config():
+    """Read ~/.easyeda2kicad/config.json plus env overrides (same rules as the CLI)."""
+    data = {}
+    try:
+        with open(os.path.expanduser("~/.easyeda2kicad/config.json"), encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            data = loaded
+    except (OSError, ValueError):
+        pass
+    for key, env in (("library", "EASYEDA2KICAD_LIBRARY"), ("projects_dir", "EASYEDA2KICAD_PROJECTS")):
+        if os.environ.get(env):
+            data[key] = os.environ[env]
+    return data
+
+
 def _default_lib_path():
+    library = _user_config().get("library")
+    if library:
+        library = os.path.expanduser(library)
+        return library if library.endswith(".kicad_sym") else library + ".kicad_sym"
     return os.path.join(
         os.path.expanduser("~"),
         "Documents", "Kicad", "easyeda2kicad", "easyeda2kicad.kicad_sym",
@@ -986,6 +1017,8 @@ def _import_one_unlocked(lcsc_id, description="", in_stock=""):
 
         price        = ""
         jlcpcb_class = ""
+        manufacturer = ""
+        mpn          = ""
         part_info = _fetch_lcsc_part_info(lcsc_id)
         if part_info:
             # Key Attributes → Description: always prefer the API's key-attribute
@@ -997,10 +1030,13 @@ def _import_one_unlocked(lcsc_id, description="", in_stock=""):
                 in_stock = str(part_info["stock"])
             price        = part_info.get("price_str", "")
             jlcpcb_class = part_info.get("jlcpcb_class", "")
+            manufacturer = part_info.get("manufacturer", "")
+            mpn          = part_info.get("mpn", "")
 
         # Always keep the part number in the Description too.
         description = _desc_with_part(description, lcsc_id)
-        add_symbol_fields(lib_path, symbol_name, description, in_stock, price, jlcpcb_class)
+        add_symbol_fields(lib_path, symbol_name, description, in_stock, price, jlcpcb_class,
+                          manufacturer, mpn)
         # Clean up any orphan left behind if EasyEDA renamed this part's symbol.
         _dedupe_lcsc_orphans(lib_path)
         return {
@@ -1149,30 +1185,56 @@ def _update_progress():
     return s
 
 
+def _refresh_fields_one(lib_path, symbol_name, lcsc_id):
+    """Refresh stock, price, class, description, Manufacturer and MPN on one symbol, in place.
+    Never touches the symbol drawing, the footprint or the 3D model."""
+    info = _fetch_lcsc_part_info(lcsc_id)
+    if not info:
+        return {"success": False, "error": "no data from LCSC"}
+    with _LIB_LOCK:
+        add_symbol_fields(lib_path, symbol_name,
+                          _desc_with_part(info.get("device_desc", ""), lcsc_id),
+                          info.get("stock", ""), info.get("price_str", ""),
+                          info.get("jlcpcb_class", ""), info.get("manufacturer", ""),
+                          info.get("mpn", ""))
+    return {"success": True}
+
+
 def _run_update_all(lib_path, symbols):
-    """Background worker: full re-import of every part, updating progress state."""
+    """Background worker for "Update All", updating progress state.
+
+    By default it only refreshes fields (stock, price, Manufacturer, MPN, ...). A full
+    re-import ("update_all": "reimport" in ~/.easyeda2kicad/config.json) regenerates every
+    symbol and footprint, which resets hand-tuned 3D model positions and can drop symbols
+    whose names changed on EasyEDA, so it's opt-in.
+    """
+    reimport = _user_config().get("update_all") == "reimport"
     for symbol_name, lcsc_id in symbols:
         with _UPDATE_LOCK:
             _UPDATE_STATE["current"] = f"{lcsc_id} ({symbol_name})"
         try:
-            res = _import_one(lcsc_id)
+            res = _import_one(lcsc_id) if reimport else _refresh_fields_one(lib_path, symbol_name, lcsc_id)
+            if not reimport:
+                time.sleep(0.5)   # be gentle with LCSC's servers
         except Exception as exc:
             res = {"success": False, "error": str(exc)}
         with _UPDATE_LOCK:
             _UPDATE_STATE["done"] += 1
             if res.get("success"):
                 _UPDATE_STATE["updated"] += 1
-                print(f"[easyeda2kicad-server] update-all: re-imported {lcsc_id} ({symbol_name})", flush=True)
+                verb = "re-imported" if reimport else "refreshed fields of"
+                print(f"[easyeda2kicad-server] update-all: {verb} {lcsc_id} ({symbol_name})", flush=True)
             else:
                 _UPDATE_STATE["failed"] += 1
                 _UPDATE_STATE["errors"].append(f"{lcsc_id}: {res.get('error', 'import failed')}")
                 print(f"[easyeda2kicad-server] update-all: FAILED {lcsc_id}: {res.get('error', '')}", flush=True)
-    # Final safety sweep: remove any orphan duplicates left by renamed symbols.
-    try:
-        with _LIB_LOCK:
-            _dedupe_lcsc_orphans(lib_path)
-    except Exception as exc:
-        print(f"[easyeda2kicad-server] update-all: final dedup failed: {exc}", flush=True)
+    # Final safety sweep after a re-import: remove orphan duplicates left by renamed symbols.
+    if reimport:
+        try:
+            with _LIB_LOCK:
+                _dedupe_lcsc_orphans(lib_path)
+        except Exception as exc:
+            print(f"[easyeda2kicad-server] update-all: final dedup failed: {exc}", flush=True)
     with _UPDATE_LOCK:
         _UPDATE_STATE["running"] = False
         _UPDATE_STATE["current"] = ""
@@ -1184,9 +1246,8 @@ def _start_update_all(lib_path):
     """
     Kick off a full re-import of every LCSC part as a background thread and return
     immediately.  The dashboard/extension poll /update-progress for live status.
-    Re-running easyeda2kicad (--full --overwrite) regenerates each symbol,
-    footprint and 3D model and refreshes stock/price/class/description — so old
-    parts are upgraded to the current format.
+    By default this refreshes each part's fields (stock, price, class, description,
+    Manufacturer, MPN) in place; see _run_update_all for the opt-in full re-import.
     """
     if not get_easyeda2kicad():
         return {"success": False, "error": "easyeda2kicad not found in PATH"}
@@ -1474,7 +1535,8 @@ def _sanitize_filename(name):
 
 def _list_projects():
     """Find KiCad projects (.kicad_pro) under the user's common project folders."""
-    roots = [
+    configured = _user_config().get("projects_dir")
+    roots = ([os.path.expanduser(configured)] if configured else []) + [
         os.path.expanduser("~/Documents/KiCad/projects"),
         os.path.expanduser("~/Documents/Kicad/projects"),
         os.path.expanduser("~/Documents/KiCad"),

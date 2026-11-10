@@ -26,6 +26,7 @@ from easyeda2kicad.kicad.export_kicad_3d_model import Exporter3dModelKicad
 from easyeda2kicad.kicad.export_kicad_footprint import ExporterFootprintKicad
 from easyeda2kicad.kicad.export_kicad_symbol import ExporterSymbolKicad
 from easyeda2kicad.kicad.parameters_kicad_symbol import KicadVersion
+from easyeda2kicad.user_config import load_user_config
 
 
 def get_parser() -> argparse.ArgumentParser:
@@ -150,6 +151,14 @@ def valid_arguments(arguments: dict) -> bool:
         if not os.path.isdir(base_folder):
             logging.error(f"Can't find the folder : {base_folder}")
             return False
+    elif load_user_config().get("library"):
+        user_config = load_user_config()
+        library = user_config["library"].replace("\\", "/")
+        base_folder = "/".join(library.split("/")[:-1])
+        lib_name = library.split("/")[-1].split(".kicad_sym")[0]
+        os.makedirs(base_folder, exist_ok=True)
+        if user_config.get("model_3d_path"):
+            arguments["configured_model_3d_path"] = user_config["model_3d_path"]
     else:
         default_folder = os.path.join(
             os.path.expanduser("~"),
@@ -322,6 +331,8 @@ def main(argv: List[str] = sys.argv[1:]) -> int:
             model_3d_path = "${EASYEDA2KICAD}/easyeda2kicad.3dshapes"
         if arguments["project_relative"]:
             model_3d_path = "${KIPRJMOD}" + model_3d_path
+        if arguments.get("configured_model_3d_path"):
+            model_3d_path = arguments["configured_model_3d_path"]
 
         ki_footprint.export(
             footprint_full_path=f"{footprint_path}/{footprint_filename}",

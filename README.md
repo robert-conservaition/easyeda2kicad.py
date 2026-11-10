@@ -8,6 +8,34 @@ It has three pieces:
 - **Background server:** runs on your Mac at `http://127.0.0.1:7777`, does the import, and hosts the dashboard
 - **Shared KiCad library:** every part lands in `~/Documents/Kicad/easyeda2kicad/`, so it's available in all your projects
 
+> **Working in the Secretary Bird Conservation `hardware` repository?** Don't follow this
+> page. That repository includes this tool and sets it up for you: run `tools/setup.sh`
+> there, and see its `docs/easyeda2kicad.md`. Parts then go into the repository's library,
+> with relative 3D paths, instead of `~/Documents/Kicad/easyeda2kicad/`.
+
+### Choosing where parts go
+
+By default, parts go to `~/Documents/Kicad/easyeda2kicad/`. To use another library, for
+example one inside a team repository, create `~/.easyeda2kicad/config.json`:
+
+```json
+{
+  "library": "/path/to/library/folder/easyeda2kicad",
+  "model_3d_path": "${KIPRJMOD}/../../libraries/easyeda2kicad/easyeda2kicad.3dshapes",
+  "projects_dir": "/path/to/projects"
+}
+```
+
+| Setting | Meaning |
+|---|---|
+| `library` | Library path without an extension. The tool writes `<library>.kicad_sym`, `.pretty`, and `.3dshapes`. |
+| `model_3d_path` | The 3D-model folder path written into footprints. It may use KiCad variables such as `${KIPRJMOD}`. |
+| `projects_dir` | Where the dashboard looks for KiCad projects. |
+
+The environment variables `EASYEDA2KICAD_LIBRARY`, `EASYEDA2KICAD_3D_PATH`, and
+`EASYEDA2KICAD_PROJECTS` override the file. Both the command line and the browser server
+read these settings. After changing them, restart the server.
+
 This is a customized fork of [uPesy/easyeda2kicad.py](https://github.com/uPesy/easyeda2kicad.py). Install it from this repo, not with `pip install easyeda2kicad`: the PyPI version doesn't have these changes.
 
 ## Set up on a new Mac
@@ -106,7 +134,7 @@ The dashboard is at http://127.0.0.1:7777/.
 
 - **Library status:** whether the server is healthy, and how many parts you have
 - **Parts monitor:** search every part, see its stock, price, and class, and refresh one part with **Update**
-- **Update All Parts:** re-import everything to refresh stock and pricing, with a live progress bar
+- **Update All Parts:** refresh stock, pricing, manufacturer and MPN on every part, with a live progress bar. It only rewrites fields, so footprints and 3D model positions you adjusted are kept. To fully re-import every part instead (this resets footprints), add `"update_all": "reimport"` to `~/.easyeda2kicad/config.json`.
 - **JLCPCB SMT BOM:** generate an assembly BOM for a project in `~/Documents/KiCad`, or paste a project path
 
 The extension's toolbar icon opens a smaller version with library status, **Update All Parts**, and an LCSC category menu.
